@@ -158,6 +158,12 @@ export interface NameRegistryEntry {
   sessionFile: string;
   /** Canonical session header id (kept for display/lineage). */
   sessionId: string | null;
+  /**
+   * Kitty window id of the tab left open by a keep-tab run, if any.
+   * Lets resume refuse to double-open a session that is still alive.
+   * Absent when the tab was closed (or was never kept).
+   */
+  surface?: string;
 }
 
 export type NameRegistry = Record<string, NameRegistryEntry>;

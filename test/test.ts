@@ -1,6 +1,6 @@
 import { describe, it, before, after, beforeEach } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, writeFileSync, readFileSync, mkdirSync, rmSync, existsSync } from "node:fs";
+import { mkdtempSync, writeFileSync, readFileSync, mkdirSync, rmSync, existsSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
@@ -43,6 +43,8 @@ import {
   observeStatus,
   loadStatusConfig,
   parseStatusConfig,
+  loadExtensionConfig,
+  parseExtensionConfig,
 } from "../pi-extension/subagents/status.ts";
 import {
   createSubagentActivityRecorder,
@@ -379,6 +381,22 @@ describe("session.ts", () => {
       // Overwrite scout with a new session file.
       registerName(adir, "scout", { sessionFile: "/s/scout-new.jsonl", sessionId: "id-scout-new" });
       assert.equal(resolveNameInRegistry(adir, "scout")!.sessionFile, "/s/scout-new.jsonl");
+    });
+
+    it("round-trips an optional kept-tab surface", () => {
+      const adir = join(dir, "art-4");
+      registerName(adir, "kept", { sessionFile: "/s/k.jsonl", sessionId: "id-k", surface: "18" });
+      assert.deepEqual(resolveNameInRegistry(adir, "kept"), {
+        sessionFile: "/s/k.jsonl",
+        sessionId: "id-k",
+        surface: "18",
+      });
+      // Entries without a surface stay bare (back-compat).
+      registerName(adir, "plain", { sessionFile: "/s/p.jsonl", sessionId: null });
+      assert.deepEqual(resolveNameInRegistry(adir, "plain"), {
+        sessionFile: "/s/p.jsonl",
+        sessionId: null,
+      });
     });
 
     it("returns null for unknown names and {} for a missing/corrupt registry", () => {
@@ -1065,6 +1083,78 @@ describe("status.ts", () => {
   });
 });
 
+describe("tabs config", () => {
+  it("defaults keepOpen to false when tabs is absent", () => {
+    assert.deepEqual(parseExtensionConfig({ status: { enabled: true } }), {
+      status: { enabled: true, lineLimit: 4 },
+      tabs: { keepOpen: false },
+    });
+  });
+
+  it("parses tabs.keepOpen", () => {
+    assert.deepEqual(
+      parseExtensionConfig({ status: { enabled: false }, tabs: { keepOpen: true } }),
+      {
+        status: { enabled: false, lineLimit: 4 },
+        tabs: { keepOpen: true },
+      },
+    );
+  });
+
+  it("treats an empty tabs section as defaults", () => {
+    assert.deepEqual(parseExtensionConfig({ status: { enabled: true }, tabs: {} }).tabs, {
+      keepOpen: false,
+    });
+  });
+
+  it("fails fast for invalid tabs shapes", () => {
+    assert.throws(
+      () => parseExtensionConfig({ status: { enabled: true }, tabs: { keepOpen: "yes" } }),
+      /tabs\.keepOpen must be a boolean/,
+    );
+    assert.throws(
+      () => parseExtensionConfig({ status: { enabled: true }, tabs: { keep_open: true } }),
+      /tabs has unsupported key\(s\): keep_open/,
+    );
+    assert.throws(
+      () => parseExtensionConfig({ status: { enabled: true }, tabs: null }),
+      /tabs must be an object/,
+    );
+  });
+
+  it("loads tabs from a config file", () => {
+    withTempDir((dir) => {
+      const configPath = join(dir, "config.json");
+      writeFileSync(
+        configPath,
+        JSON.stringify({ status: { enabled: true }, tabs: { keepOpen: true } }),
+      );
+      const config = loadExtensionConfig(configPath, join(dir, "config.json.example"));
+      assert.deepEqual(config.tabs, { keepOpen: true });
+    });
+  });
+
+  it("falls back to the example file for tabs", () => {
+    withTempDir((dir) => {
+      const examplePath = join(dir, "config.json.example");
+      writeFileSync(
+        examplePath,
+        JSON.stringify({ status: { enabled: true }, tabs: { keepOpen: true } }),
+      );
+      const config = loadExtensionConfig(join(dir, "config.json"), examplePath);
+      assert.deepEqual(config.tabs, { keepOpen: true });
+    });
+  });
+
+  it("the shipped example parses with keepOpen defaulted off", () => {
+    const examplePath = fileURLToPath(new URL("../config.json.example", import.meta.url));
+    const config = loadExtensionConfig(examplePath);
+    assert.deepEqual(config, {
+      status: { enabled: true, lineLimit: 4 },
+      tabs: { keepOpen: false },
+    });
+  });
+});
 describe("subagent discovery", () => {
   const testApi = (subagentsModule as any).__test__;
 
@@ -1585,11 +1675,13 @@ describe("subagent-done.ts", () => {
         name: process.env.PI_SUBAGENT_NAME,
         agent: process.env.PI_SUBAGENT_AGENT,
         autoExit: process.env.PI_SUBAGENT_AUTO_EXIT,
+        keepTab: process.env.PI_SUBAGENT_KEEP_TAB,
       };
       process.env.PI_SUBAGENT_SESSION = sessionFile;
       process.env.PI_SUBAGENT_NAME = "scout-2";
       process.env.PI_SUBAGENT_AGENT = "scout";
       process.env.PI_SUBAGENT_AUTO_EXIT = "1";
+      delete process.env.PI_SUBAGENT_KEEP_TAB;
       const mock = createMockExtensionApi();
       subagentDoneExtension(mock.api);
       const restore = () => {
@@ -1597,6 +1689,7 @@ describe("subagent-done.ts", () => {
         restoreEnvVar("PI_SUBAGENT_NAME", saved.name);
         restoreEnvVar("PI_SUBAGENT_AGENT", saved.agent);
         restoreEnvVar("PI_SUBAGENT_AUTO_EXIT", saved.autoExit);
+        restoreEnvVar("PI_SUBAGENT_KEEP_TAB", saved.keepTab);
       };
       return { mock, restore };
     }
@@ -1664,11 +1757,13 @@ describe("subagent-done.ts", () => {
         name: process.env.PI_SUBAGENT_NAME,
         agent: process.env.PI_SUBAGENT_AGENT,
         autoExit: process.env.PI_SUBAGENT_AUTO_EXIT,
+        keepTab: process.env.PI_SUBAGENT_KEEP_TAB,
       };
       process.env.PI_SUBAGENT_SESSION = sessionFile;
       process.env.PI_SUBAGENT_NAME = "scout-2";
       process.env.PI_SUBAGENT_AGENT = "scout";
       process.env.PI_SUBAGENT_AUTO_EXIT = "1";
+      delete process.env.PI_SUBAGENT_KEEP_TAB;
       subagentDoneExtension(api);
       const emit = (event: string, ...args: any[]) =>
         (handlers.get(event) ?? []).forEach((h) => h(...args));
@@ -1677,6 +1772,7 @@ describe("subagent-done.ts", () => {
         restoreEnvVar("PI_SUBAGENT_NAME", saved.name);
         restoreEnvVar("PI_SUBAGENT_AGENT", saved.agent);
         restoreEnvVar("PI_SUBAGENT_AUTO_EXIT", saved.autoExit);
+        restoreEnvVar("PI_SUBAGENT_KEEP_TAB", saved.keepTab);
       };
       const ask = async () => {
         const tool = tools.find((t) => t.name === "ask_question");
@@ -1741,6 +1837,151 @@ describe("subagent-done.ts", () => {
   });
 });
 
+describe("keep-open completion signal (PI_SUBAGENT_KEEP_TAB)", () => {
+  function setupKeepOpen(sessionFile: string, opts?: { autoExit?: boolean }) {
+    const saved = {
+      session: process.env.PI_SUBAGENT_SESSION,
+      autoExit: process.env.PI_SUBAGENT_AUTO_EXIT,
+      keepTab: process.env.PI_SUBAGENT_KEEP_TAB,
+    };
+    process.env.PI_SUBAGENT_SESSION = sessionFile;
+    process.env.PI_SUBAGENT_KEEP_TAB = "1";
+    if (opts?.autoExit) process.env.PI_SUBAGENT_AUTO_EXIT = "1";
+    else delete process.env.PI_SUBAGENT_AUTO_EXIT;
+    const handlers = new Map<string, Array<(...args: any[]) => void>>();
+    const api = {
+      on(event: string, handler: (...args: any[]) => void) {
+        if (!handlers.has(event)) handlers.set(event, []);
+        handlers.get(event)!.push(handler);
+      },
+      registerTool() {},
+      registerCommand() {},
+      registerMessageRenderer() {},
+      registerShortcut() {},
+      sendUserMessage() {},
+      sendMessage() {},
+      getAllTools() { return []; },
+    } as any;
+    subagentDoneExtension(api);
+    const emit = (event: string, ...args: any[]) =>
+      (handlers.get(event) ?? []).forEach((h) => h(...args));
+    const restore = () => {
+      restoreEnvVar("PI_SUBAGENT_SESSION", saved.session);
+      restoreEnvVar("PI_SUBAGENT_AUTO_EXIT", saved.autoExit);
+      restoreEnvVar("PI_SUBAGENT_KEEP_TAB", saved.keepTab);
+    };
+    return { emit, restore };
+  }
+
+  const stopTurn = (text = "done work") => ({
+    messages: [
+      { role: "assistant", stopReason: "stop", content: [{ type: "text", text }] },
+    ],
+  });
+
+  it("writes .done exactly once and stays open on a clean finish without auto-exit", () => {
+    const dir = createTestDir();
+    try {
+      const sessionFile = join(dir, "s.jsonl");
+      const { emit, restore } = setupKeepOpen(sessionFile);
+      try {
+        emit("agent_start");
+        let shutdown = false;
+        emit("agent_end", stopTurn(), { shutdown() { shutdown = true; } });
+        assert.equal(shutdown, false, "keep-open must not shut down");
+        assert.ok(existsSync(`${sessionFile}.done`), ".done signal should be written");
+        assert.deepEqual(JSON.parse(readFileSync(`${sessionFile}.done`, "utf8")), { type: "done" });
+        assert.ok(!existsSync(`${sessionFile}.exit`));
+        // A later manual turn in the open tab signals nothing more.
+        unlinkSync(`${sessionFile}.done`);
+        let shutdown2 = false;
+        emit("agent_end", stopTurn("more work"), { shutdown() { shutdown2 = true; } });
+        assert.equal(shutdown2, false);
+        assert.ok(!existsSync(`${sessionFile}.done`), "completion signals exactly once");
+      } finally {
+        restore();
+      }
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("writes .exit (not .done) on a stopReason=error turn without auto-exit", () => {
+    const dir = createTestDir();
+    try {
+      const sessionFile = join(dir, "s.jsonl");
+      const { emit, restore } = setupKeepOpen(sessionFile);
+      try {
+        emit("agent_start");
+        let shutdown = false;
+        emit("agent_end", {
+          messages: [
+            { role: "assistant", stopReason: "error", errorMessage: "529 overloaded", content: [] },
+          ],
+        }, { shutdown() { shutdown = true; } });
+        assert.equal(shutdown, false);
+        assert.ok(!existsSync(`${sessionFile}.done`));
+        const payload = JSON.parse(readFileSync(`${sessionFile}.exit`, "utf8"));
+        assert.equal(payload.type, "error");
+        assert.equal(payload.errorMessage, "529 overloaded");
+      } finally {
+        restore();
+      }
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("signals nothing when the turn aborted or child work is still in flight", () => {
+    const dir = createTestDir();
+    const KEY = Symbol.for("pi-subagents/running-children-count");
+    const prev = (globalThis as any)[KEY];
+    try {
+      const sessionFile = join(dir, "s.jsonl");
+      const { emit, restore } = setupKeepOpen(sessionFile);
+      try {
+        emit("agent_start");
+        const ctx = { shutdown() { throw new Error("must not shut down"); } } as any;
+        // Aborted turn (Escape in the tab) is not a completion.
+        emit("agent_end", {
+          messages: [{ role: "assistant", stopReason: "aborted", content: [] }],
+        }, ctx);
+        assert.ok(!existsSync(`${sessionFile}.done`));
+        assert.ok(!existsSync(`${sessionFile}.exit`));
+        // Own children still running: park, don't signal.
+        (globalThis as any)[KEY] = () => 2;
+        emit("agent_end", stopTurn(), ctx);
+        assert.ok(!existsSync(`${sessionFile}.done`));
+        assert.ok(!existsSync(`${sessionFile}.exit`));
+      } finally {
+        restore();
+      }
+    } finally {
+      (globalThis as any)[KEY] = prev;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("auto-exit still shuts down without .done when both flags are set", () => {
+    // The parent never sets both; documents precedence if it happens.
+    const dir = createTestDir();
+    try {
+      const sessionFile = join(dir, "s.jsonl");
+      const { emit, restore } = setupKeepOpen(sessionFile, { autoExit: true });
+      try {
+        emit("agent_start");
+        let shutdown = false;
+        emit("agent_end", stopTurn(), { shutdown() { shutdown = true; } });
+        assert.equal(shutdown, true);
+        assert.ok(!existsSync(`${sessionFile}.done`));
+      } finally {
+        restore();
+      }
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
 describe("kitty.ts interpretExitSidecar", () => {
   const { interpretExitSidecar } = __pollForExitTest__;
 
@@ -1785,6 +2026,41 @@ describe("kitty.ts interpretExitSidecar", () => {
   it("treats unknown payload shapes as done", () => {
     assert.deepEqual(interpretExitSidecar({}), { reason: "done", exitCode: 0 });
     assert.deepEqual(interpretExitSidecar(null), { reason: "done", exitCode: 0 });
+  });
+});
+describe("kitty.ts takeCompletionSidecar", () => {
+  const { takeCompletionSidecar } = __pollForExitTest__;
+
+  it("consumes .done as a clean finish", () => {
+    withTempDir((dir) => {
+      const sf = join(dir, "s.jsonl");
+      writeFileSync(`${sf}.done`, JSON.stringify({ type: "done" }), "utf8");
+      assert.deepEqual(takeCompletionSidecar(sf), { reason: "done", exitCode: 0 });
+      assert.ok(!existsSync(`${sf}.done`), "sidecar fires once");
+      assert.equal(takeCompletionSidecar(sf), null);
+    });
+  });
+
+  it("prefers .exit errors over .done and consumes both", () => {
+    withTempDir((dir) => {
+      const sf = join(dir, "s.jsonl");
+      writeFileSync(`${sf}.done`, JSON.stringify({ type: "done" }), "utf8");
+      writeFileSync(
+        `${sf}.exit`,
+        JSON.stringify({ type: "error", errorMessage: "boom" }),
+        "utf8",
+      );
+      const result = takeCompletionSidecar(sf);
+      assert.equal(result?.reason, "error");
+      assert.equal(result?.errorMessage, "boom");
+      assert.ok(!existsSync(`${sf}.exit`));
+    });
+  });
+
+  it("returns null when no sidecar exists", () => {
+    withTempDir((dir) => {
+      assert.equal(takeCompletionSidecar(join(dir, "missing.jsonl")), null);
+    });
   });
 });
 describe("commands", () => {
@@ -2487,6 +2763,25 @@ describe("subagent startup delay", () => {
     } finally {
       if (original == null) delete process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS;
       else process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS = original;
+    }
+  });
+});
+describe("subagent keep-tab", () => {
+  it("shouldKeepSurface is config-driven (tabs.keepOpen), never shell env", () => {
+    const testApi = (subagentsModule as any).__test__;
+    assert.ok(testApi, "expected subagents test helpers to be exported");
+    assert.equal(typeof testApi.shouldKeepSurface, "function");
+
+    // Shell env must not flip the decision either way, whatever the local
+    // config says — config is the only source.
+    const before = testApi.shouldKeepSurface();
+    const original = process.env.PI_SUBAGENT_KEEP_TAB;
+    try {
+      process.env.PI_SUBAGENT_KEEP_TAB = before ? "0" : "1";
+      assert.equal(testApi.shouldKeepSurface(), before);
+    } finally {
+      if (original == null) delete process.env.PI_SUBAGENT_KEEP_TAB;
+      else process.env.PI_SUBAGENT_KEEP_TAB = original;
     }
   });
 });

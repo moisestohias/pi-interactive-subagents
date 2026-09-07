@@ -25,6 +25,16 @@ If your shell startup is slow and launch commands get dropped before the prompt 
 export PI_SUBAGENT_SHELL_READY_DELAY_MS=2500   # default: 500
 ```
 
+To leave finished sub-agent tabs open instead of closing them, set `tabs.keepOpen` in `config.json` (see
+[configuration](#status-widget--configuration)).
+
+With it on, the worker's pi session **stays open and interactive** after finishing its task — the tab is not
+just left behind, pi itself keeps running there. The run still completes normally from the orchestrator's side
+(widget counter drops, result is steered back once, completion message notes the open tab). After that, follow
+up by typing directly in the kept tab. `subagent_message` to that name is refused while its tab is alive (two pi
+processes must never share one session file) — close the tab and retry if you want a resumed run instead.
+Aborted runs (session shutdown/reload) always clean up their tabs. Applies on `/reload`, no pi restart needed.
+
 ## Tools
 
 | Tool | Description |
@@ -167,13 +177,20 @@ Set a per-agent default with `cwd:` in frontmatter.
 
 The widget tracks each sub-agent from a runtime activity snapshot written by the child: `starting`, `active` (turn/provider/tool work), `waiting` (open for input or another stage), `stalled` (no valid snapshot for too long), or `running` (fallback). Sub-agent sessions also show their own tools widget — toggle it with `Ctrl+Alt+O`. Completion messages expand with `Ctrl+O`.
 
-Status display is configured via `config.json` in the extension directory (copy `config.json.example`; it's gitignored):
+The extension is configured via `config.json` in the extension directory (copy `config.json.example`; it's
+gitignored). Applies on `/reload`, no pi restart needed:
 
 ```json
 {
-  "status": { "enabled": true }
+  "status": { "enabled": true },
+  "tabs": { "keepOpen": false }
 }
 ```
+
+| Key | Default | Description |
+| --- | ------- | ----------- |
+| `status.enabled` | `true` | Live per-subagent status in the widget (active tool, waits, stall/recovery pings) |
+| `tabs.keepOpen` | `false` | Leave finished sub-agent tabs open with pi still interactive (see above) |
 
 ## Requirements
 

@@ -24,6 +24,7 @@ import {
   closeSurface,
   shellEscape,
   readScreen,
+  windowExists,
 } from "./kitty.ts";
 
 import {
@@ -52,7 +53,7 @@ import {
   formatStatusAggregate,
   formatTransitionLine,
   observeStatus,
-  loadStatusConfig,
+  loadExtensionConfig,
 } from "./status.ts";
 import {
   getSubagentActivityFile,
@@ -503,6 +504,23 @@ function getShellReadyDelayMs(): number {
   return Number.isFinite(parsed) && parsed >= 0 ? parsed : 500;
 }
 
+/**
+ * Whether finished subagent tabs stay open (with pi still interactive).
+ * Decided by `tabs.keepOpen` in config.json — the single source of truth,
+ * reloaded on pi's /reload. `PI_SUBAGENT_KEEP_TAB` is only the internal
+ * parent→child wire for runs launched while this is on; user shell env is
+ * never consulted.
+ */
+function shouldKeepSurface(): boolean {
+  return tabsConfig.keepOpen === true;
+}
+
+/** Close a finished subagent's tab unless the user asked to keep it open. */
+function maybeCloseSurface(surface: string): void {
+  if (shouldKeepSurface()) return;
+  closeSurface(surface);
+}
+
 function muxUnavailableResult() {
   return {
     content: [
@@ -525,7 +543,9 @@ function getArtifactDir(sessionDir: string, sessionId: string): string {
   return join(sessionDir, "artifacts", sessionId);
 }
 
-const statusConfig = loadStatusConfig();
+const extensionConfig = loadExtensionConfig();
+const statusConfig = extensionConfig.status;
+const tabsConfig = extensionConfig.tabs;
 
 function formatWidgetRightLabel(snapshot: StatusSnapshot): string {
   if (snapshot.kind === "starting") return " starting… ";
@@ -594,6 +614,8 @@ interface SubagentResult {
   errorMessage?: string;
   /** Aggregate usage/model/tool stats parsed from the completed session file. */
   stats?: SessionStats;
+  /** True when the tab was left open (PI_SUBAGENT_KEEP_TAB) instead of closed. */
+  surfaceKept?: boolean;
 }
 
 /**
@@ -1122,6 +1144,7 @@ function resolveResumeLaunchBehavior(): { autoExit: boolean; interactive: boolea
 export const __test__ = {
   borderLine,
   getShellReadyDelayMs,
+  shouldKeepSurface,
   renderSubagentWidgetLines,
   loadAgentDefaults,
   discoverAgentDefinitions,
@@ -1370,8 +1393,14 @@ async function launchSubagent(
   if (params.agent) {
     envParts.push(`PI_SUBAGENT_AGENT=${shellEscape(params.agent)}`);
   }
-  if (agentDefs?.autoExit) {
+  // Keep-open mode (config `tabs.keepOpen`) suppresses auto-exit so the
+  // session stays interactive, and passes the internal wire telling the
+  // child to report its first clean finish via `.done` instead.
+  if (agentDefs?.autoExit && !shouldKeepSurface()) {
     envParts.push(`PI_SUBAGENT_AUTO_EXIT=1`);
+  }
+  if (shouldKeepSurface()) {
+    envParts.push(`PI_SUBAGENT_KEEP_TAB=1`);
   }
   envParts.push(`PI_SUBAGENT_SESSION=${shellEscape(subagentSessionFile)}`);
   envParts.push(`PI_SUBAGENT_ID=${shellEscape(id)}`);
@@ -1570,10 +1599,10 @@ async function watchSubagent(
         try { unlinkSync(running.sentinelFile + ".transcript"); } catch {}
       }
 
-      closeSurface(surface);
+      maybeCloseSurface(surface);
       runningSubagents.delete(running.id);
 
-      return { name, task, summary, exitCode: result.exitCode, elapsed, ...(sessionId ? { claudeSessionId: sessionId } : {}) };
+      return { name, task, summary, exitCode: result.exitCode, elapsed, surfaceKept: shouldKeepSurface(), ...(sessionId ? { claudeSessionId: sessionId } : {}) };
     }
 
     // Pi subagent result extraction
@@ -1598,7 +1627,7 @@ async function watchSubagent(
     const stats = existsSync(sessionFile) ? summarizeSessionStats(sessionFile) : null;
     const subagentSessionId = existsSync(sessionFile) ? getSessionId(sessionFile) : null;
 
-    closeSurface(surface);
+    maybeCloseSurface(surface);
     runningSubagents.delete(running.id);
 
     return {
@@ -1606,6 +1635,7 @@ async function watchSubagent(
       task,
       summary,
       sessionFile,
+      surfaceKept: shouldKeepSurface(),
       ...(subagentSessionId ? { sessionId: subagentSessionId } : {}),
       exitCode: result.exitCode,
       elapsed,
@@ -1614,7 +1644,10 @@ async function watchSubagent(
     };
   } catch (err: any) {
     try {
-      closeSurface(surface);
+      // Aborts mean this session is going away (shutdown/reload) — always
+      // clean up. Genuine errors honor keep-open for inspection.
+      if (signal.aborted) closeSurface(surface);
+      else maybeCloseSurface(surface);
     } catch {}
     runningSubagents.delete(running.id);
 
@@ -1828,7 +1861,17 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           .then((result) => {
             updateWidget(); // reflect removal from Map immediately
 
-            const presentation = resolveResultPresentation(result, running.name);
+            // Keep the registry truthful about kept tabs (feeds the resume
+            // double-open guard); clears any stale surface otherwise.
+            registerName(parentArtifactDir, running.name, {
+              sessionFile: running.sessionFile,
+              sessionId: result.sessionId ?? null,
+              ...(result.surfaceKept ? { surface: running.surface } : {}),
+            });
+
+            const presentation =
+              resolveResultPresentation(result, running.name) +
+              (result.surfaceKept ? "\n\n(Kitty tab left open — close it yourself when done.)" : "");
 
             pi.sendMessage(
               {
@@ -2129,6 +2172,24 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           }
         }
 
+        // Refuse to double-open a session that is still alive in a kept tab:
+        // two pi processes appending to one .jsonl corrupts it. The tab is
+        // interactive — follow up by typing there, or close it and retry.
+        if (entry.surface && windowExists(entry.surface)) {
+          const err =
+            `Subagent "${requestedName}" is still open in its kept tab. ` +
+            `Type your follow-up directly in that tab, or close the tab and retry.`;
+          return { content: [{ type: "text" as const, text: err }], details: { error: err } };
+        }
+
+        // A new watcher is starting: drop completion sidecars from any earlier
+        // run so a stale `.done`/`.exit` can't complete the new run instantly.
+        for (const ext of [".done", ".exit"]) {
+          try {
+            unlinkSync(`${sessionPath}${ext}`);
+          } catch {}
+        }
+
         // Reconstruct the sandbox from the snapshot written at spawn time.
         // Without it we cannot safely resume: relaunching bare would load every
         // global extension + the full toolset. Refuse rather than escalate.
@@ -2203,8 +2264,11 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         resumeEnvParts.push(`PI_SUBAGENT_SESSION=${shellEscape(sessionPath)}`);
         resumeEnvParts.push(`PI_SUBAGENT_ID=${shellEscape(id)}`);
         resumeEnvParts.push(`PI_SUBAGENT_ACTIVITY_FILE=${shellEscape(activityFile)}`);
-        if (autoExit) {
+        if (autoExit && !shouldKeepSurface()) {
           resumeEnvParts.push(`PI_SUBAGENT_AUTO_EXIT=1`);
+        }
+        if (shouldKeepSurface()) {
+          resumeEnvParts.push(`PI_SUBAGENT_KEEP_TAB=1`);
         }
         const resumeEnvPrefix = resumeEnvParts.join(" ") + " ";
 
@@ -2262,6 +2326,12 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           .then((result) => {
             updateWidget();
 
+            registerName(parentArtifactDir, name, {
+              sessionFile: sessionPath,
+              sessionId: resumedSessionId,
+              ...(result.surfaceKept ? { surface: running.surface } : {}),
+            });
+
             const allEntries = getNewEntries(sessionPath, entryCountBefore);
             const summary = findLastAssistantMessage(allEntries) ??
               (result.errorMessage
@@ -2269,10 +2339,11 @@ export default function subagentsExtension(pi: ExtensionAPI) {
                 : result.exitCode !== 0
                   ? `Resumed session exited with code ${result.exitCode}`
                   : "Resumed session exited without new output");
-            const presentation = resolveResultPresentation(
-              { ...result, summary, sessionFile: sessionPath, sessionId: resumedSessionId },
-              name,
-            );
+            const presentation =
+              resolveResultPresentation(
+                { ...result, summary, sessionFile: sessionPath, sessionId: resumedSessionId },
+                name,
+              ) + (result.surfaceKept ? "\n\n(Kitty tab left open — close it yourself when done.)" : "");
 
             pi.sendMessage(
               {

@@ -5,7 +5,9 @@
  *
  * Subagents do NOT self-terminate via a tool. Auto-exit agents shut down
  * automatically when their agent loop ends (see the `agent_end` handler);
- * interactive agents end when the human exits the pane.
+ * interactive agents end when the human exits the pane. In keep-open mode
+ * (`PI_SUBAGENT_KEEP_TAB=1`, auto-exit suppressed by the parent) the session
+ * stays interactive after finishing and signals completion once via `.done`.
  *
  * `ask_question` keeps the session OPEN: it writes a `${sessionFile}.ask`
  * signal the parent's watcher picks up, parks the session in a "waiting" state
@@ -120,6 +122,16 @@ export default function (pi: ExtensionAPI) {
   const subagentAgent = process.env.PI_SUBAGENT_AGENT ?? "";
   const deniedToolsValue = process.env.PI_DENY_TOOLS;
   const autoExit = process.env.PI_SUBAGENT_AUTO_EXIT === "1";
+  // Keep-open mode (parent sets this from config `tabs.keepOpen` when the run
+  // is launched with tabs kept open): the session stays interactive after
+  // finishing instead of shutting down, and reports its first clean finish
+  // once via a `.done` sidecar so the parent is still notified. Errors use
+  // the same `.exit` sidecar as the auto-exit path. Internal wire — users set
+  // `tabs.keepOpen` in config.json, never this variable directly.
+  const keepOpen = ["1", "true", "yes"].includes(
+    (process.env.PI_SUBAGENT_KEEP_TAB ?? "").trim().toLowerCase(),
+  );
+  let completionSignaled = false;
   const recorder = createSubagentActivityRecorder({
     runningChildId: process.env.PI_SUBAGENT_ID,
     activityFile: process.env.PI_SUBAGENT_ACTIVITY_FILE,
@@ -233,11 +245,11 @@ export default function (pi: ExtensionAPI) {
     // In both cases the session parks as `waiting` and resumes when the next
     // turn lands.
     const hasPendingChildren = runningChildrenCount() > 0;
-    const shouldExit =
+    const finishedTurn =
       !awaitingAnswer &&
       !hasPendingChildren &&
-      autoExit &&
       shouldAutoExitOnAgentEnd(userTookOver, messages);
+    const shouldExit = finishedTurn && autoExit;
 
     if (shouldExit) {
       // Surface stopReason: "error" turns (auto-retry exhausted, provider
@@ -266,6 +278,32 @@ export default function (pi: ExtensionAPI) {
       recorder.agentEndDone();
       ctx.shutdown();
       return;
+    }
+
+    if (!autoExit && keepOpen && finishedTurn && !completionSignaled) {
+      // Staying open by request: tell the parent this turn finished (once —
+      // later manual turns belong to whoever is driving this tab now).
+      completionSignaled = true;
+      const sessionFile = process.env.PI_SUBAGENT_SESSION;
+      const errorInfo = findLatestAssistantError(messages);
+      if (sessionFile) {
+        try {
+          if (errorInfo) {
+            writeFileSync(
+              `${sessionFile}.exit`,
+              JSON.stringify({
+                type: "error",
+                errorMessage: errorInfo.errorMessage,
+                stopReason: errorInfo.stopReason,
+              }),
+            );
+          } else {
+            writeFileSync(`${sessionFile}.done`, JSON.stringify({ type: "done" }));
+          }
+        } catch {
+          // Best effort — the watcher falls back to the session file.
+        }
+      }
     }
 
     recorder.agentEndWaiting();

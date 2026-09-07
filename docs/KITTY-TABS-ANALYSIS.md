@@ -334,3 +334,16 @@ query/response traffic plus mutual byte-stealing stalls input handling (symptom 
 (`KITTY_LISTEN_ON` + `--to`) is now REQUIRED — `isMuxAvailable()` refuses tty-only setups with an actionable hint
 instead of corrupting the session. One-time user setup: `allow_remote_control yes` + `listen_on` in kitty.conf,
 restart kitty.
+
+## 11. Keep-open mode (`tabs.keepOpen`): pi stays interactive
+
+Keep-tab first only left the shell open (pi had already exited). Full behavior now: with `tabs.keepOpen: true`
+in config.json, the parent suppresses `PI_SUBAGENT_AUTO_EXIT` and passes the internal `PI_SUBAGENT_KEEP_TAB=1`
+wire in the child env, so pi stays interactive after its task; the child reports its first clean finish once via
+a `.done` sidecar (errors reuse `.exit`), which the parent's poller consumes like an exit — same notification,
+same widget drop, tab left open. Config is the only decision source (shell env is never consulted; applies on
+`/reload`); the env var survives purely as the parent→child launch wire. Signals after the first belong to
+whoever drives the tab (in-memory `completionSignaled` flag, one shot). Safety: resume refuses while the kept
+tab is alive (two pi processes must never share one `.jsonl`) — the kept window id is persisted in the
+name-registry entry (`surface?`), so the guard survives restarts; stale sidecars are cleared at resume start;
+aborts (shutdown/reload) always close tabs.

@@ -149,6 +149,39 @@ export function parseStatusConfig(rawConfig: unknown, source = "config.json"): S
   };
 }
 
+export interface TabsConfig {
+  /** Leave finished sub-agent tabs open (with pi still interactive) instead of closing them. */
+  keepOpen: boolean;
+}
+
+export interface ExtensionConfig {
+  status: StatusConfig;
+  tabs: TabsConfig;
+}
+
+const DEFAULT_TABS_CONFIG: TabsConfig = { keepOpen: false };
+
+/**
+ * Parse the optional `tabs` section. Absent (or keyless) means defaults —
+ * existing configs without a `tabs` section keep working unchanged.
+ * Present means strict, same pattern as `status`.
+ */
+export function parseTabsConfig(value: unknown, source = "config.json"): TabsConfig {
+  if (value === undefined) return { ...DEFAULT_TABS_CONFIG };
+  const tabs = requireObject(value, source, "tabs");
+  rejectUnsupportedKeys(tabs, ["keepOpen"], source, "tabs");
+  if (!("keepOpen" in tabs)) return { ...DEFAULT_TABS_CONFIG };
+  return { keepOpen: requireBoolean(tabs.keepOpen, source, "tabs.keepOpen") };
+}
+
+export function parseExtensionConfig(rawConfig: unknown, source = "config.json"): ExtensionConfig {
+  const config = requireObject(rawConfig, source, "root");
+  return {
+    status: parseStatusConfig(rawConfig, source),
+    tabs: parseTabsConfig(config.tabs, source),
+  };
+}
+
 function readStatusConfigFile(configPath: string, examplePath: string): { sourcePath: string; rawConfig: string } {
   try {
     return { sourcePath: configPath, rawConfig: readFileSync(configPath, "utf8") };
@@ -170,10 +203,10 @@ function readStatusConfigFile(configPath: string, examplePath: string): { source
   }
 }
 
-export function loadStatusConfig(
-  configPath = DEFAULT_STATUS_CONFIG_PATH,
-  examplePath = STATUS_CONFIG_EXAMPLE_PATH,
-): StatusConfig {
+function readRawSubagentConfig(
+  configPath: string,
+  examplePath: string,
+): { sourcePath: string; parsed: unknown } {
   const { sourcePath, rawConfig } = readStatusConfigFile(configPath, examplePath);
 
   let parsed: unknown;
@@ -184,7 +217,23 @@ export function loadStatusConfig(
     throw new Error(`Invalid JSON in subagent config ${sourcePath}: ${detail}`);
   }
 
+  return { sourcePath, parsed };
+}
+
+export function loadStatusConfig(
+  configPath = DEFAULT_STATUS_CONFIG_PATH,
+  examplePath = STATUS_CONFIG_EXAMPLE_PATH,
+): StatusConfig {
+  const { sourcePath, parsed } = readRawSubagentConfig(configPath, examplePath);
   return parseStatusConfig(parsed, sourcePath);
+}
+
+export function loadExtensionConfig(
+  configPath = DEFAULT_STATUS_CONFIG_PATH,
+  examplePath = STATUS_CONFIG_EXAMPLE_PATH,
+): ExtensionConfig {
+  const { sourcePath, parsed } = readRawSubagentConfig(configPath, examplePath);
+  return parseExtensionConfig(parsed, sourcePath);
 }
 
 export function formatElapsedDuration(ms: number): string {

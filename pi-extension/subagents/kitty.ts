@@ -329,7 +329,32 @@ function interpretExitSidecar(data: any): PollResult {
   return { reason: "done", exitCode: 0 };
 }
 
-export const __pollForExitTest__ = { interpretExitSidecar };
+/**
+ * Consume a completion sidecar next to the session file, if present.
+ * `.exit` (error) wins over `.done` (clean finish with the session left
+ * open via PI_SUBAGENT_KEEP_TAB). Returns null when neither exists.
+ * Files are deleted on read so each signal fires once.
+ */
+function takeCompletionSidecar(sessionFile: string): PollResult | null {
+  try {
+    const exitFile = `${sessionFile}.exit`;
+    if (existsSync(exitFile)) {
+      const data = JSON.parse(readFileSync(exitFile, "utf-8"));
+      rmSync(exitFile, { force: true });
+      return interpretExitSidecar(data);
+    }
+  } catch {}
+  try {
+    const doneFile = `${sessionFile}.done`;
+    if (existsSync(doneFile)) {
+      rmSync(doneFile, { force: true });
+      return { reason: "done", exitCode: 0 };
+    }
+  } catch {}
+  return null;
+}
+
+export const __pollForExitTest__ = { interpretExitSidecar, takeCompletionSidecar };
 
 /**
  * Poll until the subagent exits. Checks for a `.exit` sidecar file first
@@ -353,16 +378,10 @@ export async function pollForExit(
       throw new Error("Aborted while waiting for subagent to finish");
     }
 
-    // Fast path: check for .exit sidecar file (written by the error path)
+    // Fast path: completion sidecars (.exit error / .done clean-but-open).
     if (options.sessionFile) {
-      try {
-        const exitFile = `${options.sessionFile}.exit`;
-        if (existsSync(exitFile)) {
-          const data = JSON.parse(readFileSync(exitFile, "utf-8"));
-          rmSync(exitFile, { force: true });
-          return interpretExitSidecar(data);
-        }
-      } catch {}
+      const sidecar = takeCompletionSidecar(options.sessionFile);
+      if (sidecar) return sidecar;
     }
 
     // Check Claude sentinel file (written by plugin Stop hook)
@@ -382,16 +401,10 @@ export async function pollForExit(
         return { reason: "sentinel", exitCode: parseInt(match[1], 10) };
       }
     } catch {
-      // Surface may have been destroyed — check if .exit file appeared in the meantime
+      // Surface may have been destroyed — check if a sidecar appeared in the meantime
       if (options.sessionFile) {
-        try {
-          const exitFile = `${options.sessionFile}.exit`;
-          if (existsSync(exitFile)) {
-            const data = JSON.parse(readFileSync(exitFile, "utf-8"));
-            rmSync(exitFile, { force: true });
-            return interpretExitSidecar(data);
-          }
-        } catch {}
+        const sidecar = takeCompletionSidecar(options.sessionFile);
+        if (sidecar) return sidecar;
       }
     }
 
