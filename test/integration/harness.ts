@@ -2,11 +2,11 @@
  * Integration test harness for pi-interactive-subagents.
  *
  * Provides utilities to:
- * - Detect whether tmux is available
+ * - Detect whether kitty tabs are available
  * - Create isolated test environments with test agent definitions
- * - Start real pi sessions in tmux panes
+ * - Start real pi sessions in kitty tabs
  * - Poll for file creation and screen output
- * - Clean up panes and temp files after tests
+ * - Clean up tabs and temp files after tests
  */
 import { execFileSync } from "node:child_process";
 import {
@@ -32,9 +32,9 @@ import {
   readScreenAsync,
   closeSurface,
   shellEscape,
-} from "../../pi-extension/subagents/tmux.ts";
+} from "../../pi-extension/subagents/kitty.ts";
 
-// Re-export tmux primitives for tests
+// Re-export kitty surface primitives for tests
 export {
   createSurface,
   createSurfaceSplit,
@@ -76,24 +76,36 @@ export const PI_TIMEOUT = Number(process.env.PI_TEST_TIMEOUT ?? "120000");
 // ── Backend detection ──
 
 /**
- * Detect whether tmux is available in the current environment.
- * Returns ["tmux"] or [].
+ * Detect whether kitty tabs are available in the current environment.
+ * Returns ["kitty"] or [].
  */
 export function getAvailableBackends(): string[] {
-  return isMuxAvailable() ? ["tmux"] : [];
+  return isMuxAvailable() ? ["kitty"] : [];
+}
+
+function kittyTo(surface: string): string[] {
+  return process.env.KITTY_LISTEN_ON ? ["--to", process.env.KITTY_LISTEN_ON] : [];
 }
 
 export function focusSurface(surface: string): void {
-  execFileSync("tmux", ["select-pane", "-t", surface], { encoding: "utf8" });
+  execFileSync("kitty", ["@", ...kittyTo(surface), "focus-window", "--match", `id:${surface}`], {
+    encoding: "utf8",
+  });
 }
 
 export function getFocusedSurface(): string | null {
   try {
-    const panes = execFileSync("tmux", ["list-panes", "-F", "#{pane_id} #{pane_active}"], {
-      encoding: "utf8",
-    });
-    const activeLine = panes.split("\n").find((line) => line.endsWith(" 1"));
-    return activeLine?.split(" ")[0] ?? null;
+    const args = ["@", ...kittyTo(""), "ls"];
+    const out = execFileSync("kitty", args, { encoding: "utf8" });
+    const osWindows = JSON.parse(out);
+    for (const osWindow of osWindows) {
+      for (const tab of (osWindow as any)?.tabs ?? []) {
+        for (const window of (tab as any)?.windows ?? []) {
+          if ((window as any)?.is_focused) return String((window as any).id);
+        }
+      }
+    }
+    return null;
   } catch {
     return null;
   }
@@ -110,7 +122,7 @@ export async function waitForFocusedSurface(
   }
 
   throw new Error(
-    `Timeout (${timeout}ms) waiting for focused tmux pane ${surface}; ` +
+    `Timeout (${timeout}ms) waiting for focused kitty window ${surface}; ` +
       `current focus is ${getFocusedSurface() ?? "unknown"}`,
   );
 }
@@ -120,7 +132,7 @@ export async function waitForFocusedSurface(
 export interface TestEnv {
   /** Temp directory serving as the test project root */
   dir: string;
-  /** Panes created during the test (cleaned up automatically) */
+  /** Tabs created during the test (cleaned up automatically) */
   surfaces: string[];
   /** Temp files to clean up */
   tempFiles: string[];
