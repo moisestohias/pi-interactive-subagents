@@ -1411,9 +1411,20 @@ describe("subagent discovery", () => {
     );
   });
 
-  it("buildSubagentToolAllowlist returns null without an explicit tool restriction", () => {
-    assert.equal(testApi.buildSubagentToolAllowlist(undefined), null);
-    assert.equal(testApi.buildSubagentToolAllowlist(""), null);
+  it("buildSubagentToolAllowlist defaults header-less agents to baseline tools + ask_question", () => {
+    assert.deepEqual([...testApi.DEFAULT_SUBAGENT_TOOLS], ["read", "write", "edit", "bash"]);
+    // No header, no spawn grant → baseline + ask_question, never spawning tools.
+    assert.equal(
+      testApi.buildSubagentToolAllowlist(undefined),
+      "read,write,edit,bash,ask_question",
+    );
+    assert.equal(testApi.buildSubagentToolAllowlist(""), "read,write,edit,bash,ask_question");
+    assert.equal(testApi.buildSubagentToolAllowlist(" , "), "read,write,edit,bash,ask_question");
+    // No header + spawn grant → baseline + spawning + ask_question.
+    const granted = testApi.buildSubagentToolAllowlist(undefined, { grantSpawning: true });
+    for (const t of ["read", "write", "edit", "bash", "subagent", "subagent_message", "subagents_list", "ask_question"]) {
+      assert.ok(new Set(granted.split(",")).has(t), `expected ${t} in ${granted}`);
+    }
   });
 
   it("applySandboxToParts replays model, identity, and default-deny tool restriction", () => {

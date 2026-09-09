@@ -1038,12 +1038,25 @@ function updateWidget() {
 const SUBAGENT_CONTROL_TOOLS = ["ask_question"] as const;
 
 /**
+ * Least-privilege baseline when an agent definition omits the `tools`
+ * frontmatter header: file basics only. `ask_question` (child control) is
+ * always added on top, and the spawning toolset only when the
+ * `subagent_agents` gate grants it — so a header-less agent can work and ask,
+ * but can never spawn unless explicitly allowed.
+ */
+const DEFAULT_SUBAGENT_TOOLS = ["read", "write", "edit", "bash"] as const;
+
+/**
  * Build the child --tools allowlist.
  *
  * Pi 0.70+ applies --tools to built-in, extension, and custom tools. If a
  * subagent definition restricts tools to e.g. "read,bash,write", the child
  * control tools from subagent-done.ts would otherwise be hidden, leaving a
  * manually resumed or user-touched subagent unable to call ask_question.
+ *
+ * Returns null only for explicitly-unrestricted legacy loadouts (replayed
+ * as-is); every live launch resolves to a concrete list — the `tools` header
+ * when present, else DEFAULT_SUBAGENT_TOOLS.
  */
 function buildSubagentToolAllowlist(
   effectiveTools?: string,
@@ -1056,11 +1069,12 @@ function buildSubagentToolAllowlist(
 
   const grantSpawning = opts?.grantSpawning ?? false;
 
-  // No explicit tool restriction and no spawning grant → don't pass --tools at
-  // all (the child keeps its default toolset).
-  if (requested.length === 0 && !grantSpawning) return null;
+  // No `tools` header → baseline defaults instead of an unrestricted child
+  // (which would inherit every global extension, including this extension's
+  // own spawning toolset). Explicit headers stay exactly as listed.
+  const base = requested.length > 0 ? requested : [...DEFAULT_SUBAGENT_TOOLS];
 
-  const allow = new Set(requested);
+  const allow = new Set(base);
   if (grantSpawning) {
     for (const tool of SPAWNING_TOOLS) allow.add(tool);
   }
@@ -1108,8 +1122,8 @@ function applySandboxToParts(
   }
 
   // Default-deny: disable global extension discovery and re-enable only the
-  // extensions backing the whitelisted tools. A null allowlist means the spawn
-  // was intentionally unrestricted (e.g. a fork clone) and is replayed as-is.
+  // extensions backing the whitelisted tools. A null allowlist only occurs for
+  // pre-default legacy loadout snapshots and is replayed as-is (unrestricted).
   if (loadout.toolAllowlist) {
     parts.push("--no-extensions");
     parts.push("--tools", shellEscape(loadout.toolAllowlist));
@@ -1386,6 +1400,7 @@ export const __test__ = {
   resolveEffectiveInteractive,
   parseSubagentAgents,
   canSpawnSubagents,
+  DEFAULT_SUBAGENT_TOOLS,
   buildSubagentToolAllowlist,
   applySandboxToParts,
   buildPiPromptArgs,
@@ -1602,10 +1617,11 @@ async function launchSubagent(
       ? localAgentDir
       : process.env.PI_CODING_AGENT_DIR ?? null;
 
-  // Default-deny model: when an agent restricts its tools (or is granted the
-  // spawning toolset), we disable global extension discovery and re-enable only
-  // the extensions backing the whitelisted tools. Bare/fork spawns with no tool
-  // restriction keep their full default toolset and all global extensions.
+  // Default-deny model: every child launches with --no-extensions and an
+  // explicit --tools list (the `tools` header when present, else the
+  // read/write/edit/bash baseline). Only the extensions backing the listed
+  // tools are loaded back in, so a child never inherits the parent's full
+  // toolset or global extensions by accident.
   const toolAllowlist = buildSubagentToolAllowlist(effectiveTools, { grantSpawning });
 
   // Snapshot the fully-resolved sandbox beside the session file so a later

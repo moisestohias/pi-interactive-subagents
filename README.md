@@ -118,7 +118,7 @@ You are a specialized agent that does X...
 | `description` | string | Shown in `subagents_list` |
 | `model` | string | Default model |
 | `thinking` | string | `minimal`, `low`, `medium`, or `high` |
-| `tools` | string | Strict tool allowlist. Built-ins: `read`, `write`, `edit`, `bash`, `grep`, `find`, `ls`. Extension-backed: `web_search`, `web_fetch`, `safe_bash`, `video_extract`, `youtube_search`, `google_image_search`. Only the extensions backing the listed tools are loaded into the child |
+| `tools` | string | Strict tool allowlist. Built-ins: `read`, `write`, `edit`, `bash`, `grep`, `find`, `ls`. Extension-backed: `web_search`, `web_fetch`, `safe_bash`, `video_extract`, `youtube_search`, `google_image_search`. Only the extensions backing the listed tools are loaded into the child. Omit it and the child gets the `read, write, edit, bash` baseline (`ask_question` always added; spawning tools only via `subagent_agents`) |
 | `subagent_agents` | boolean \| string | Whether this agent may spawn sub-agents. `true` grants the spawning toolset (`subagent`, `subagent_message`, `subagents_list`) with no target restriction; a comma-separated list grants it restricted to those agents. Omit it, leave it empty, or set `false` and the agent cannot spawn at all |
 | `skills` | string | Comma-separated skill names to auto-load |
 | `session-mode` | string | `standalone` (default), `lineage-only`, or `fork` — see below |
@@ -156,7 +156,7 @@ Controls whether `stalled`/`recovered` status transitions send a steer message t
 
 ## Tool access control
 
-Access is **whitelist-only**. Every sub-agent process is launched with `--no-extensions` (extension discovery disabled) and `--tools <allowlist>`; only the extensions backing the listed tools are loaded back in explicitly. There is no default toolset and no deny-list — an agent gets exactly what its frontmatter lists. The restriction survives resume via the loadout snapshot.
+Access is **whitelist-only**. Every sub-agent process is launched with `--no-extensions` (extension discovery disabled) and `--tools <allowlist>`; only the extensions backing the listed tools are loaded back in explicitly. An agent gets exactly what its frontmatter `tools` lists — or, when the header is omitted, the `read, write, edit, bash` baseline. `ask_question` is always added on top, and the spawning toolset only when `subagent_agents` grants it (`true` or a list). The restriction survives resume via the loadout snapshot.
 
 Spawns must name a known agent at **every** depth. A top-level session may spawn anything discoverable; a sub-agent may only spawn what its `subagent_agents` allows — any agent for `true`, only the listed agents for a list (enforced via `PI_SUBAGENT_ALLOWED`; missing or `false` means it cannot spawn at all). There is no agentless spawn route, so a child can never escalate to a full-toolset profile by omitting its agent.
 
