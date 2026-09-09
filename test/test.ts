@@ -2826,6 +2826,97 @@ describe("subagent keep-tab (config.json sole truth, no KEEP_TAB wire)", () => {
     assert.equal(testApi.shouldKeepForAgent(null), keepOpen);
   });
 });
+describe("ask_question delivery (subagent_question)", () => {
+  it("delivers .ask to the spawner's pi instance and consumes the file once", () => {
+    const testApi = (subagentsModule as any).__test__;
+    assert.equal(typeof testApi.deliverPendingQuestion, "function");
+    const dir = createTestDir();
+    try {
+      const sessionFile = join(dir, "s.jsonl");
+      writeFileSync(sessionFile, '{"type":"session","id":"abc"}\n');
+      writeFileSync(`${sessionFile}.ask`, JSON.stringify({ question: "Which API?" }));
+      const sent: any[] = [];
+      const fakePi = { sendMessage: (msg: any, opts: any) => { sent.push({ msg, opts }); } };
+      const running = { name: "scout", agent: "scout", sessionFile, startTime: Date.now() };
+      assert.equal(testApi.deliverPendingQuestion(running, fakePi), true);
+      assert.equal(sent.length, 1);
+      assert.equal(sent[0].msg.customType, "subagent_question");
+      assert.match(sent[0].msg.content, /Which API\?/);
+      assert.equal(sent[0].opts?.triggerTurn, true);
+      assert.ok(!existsSync(`${sessionFile}.ask`), ".ask fires once");
+      assert.equal(testApi.deliverPendingQuestion(running, fakePi), false);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps .ask for retry when delivery throws", () => {
+    const testApi = (subagentsModule as any).__test__;
+    const dir = createTestDir();
+    try {
+      const sessionFile = join(dir, "s.jsonl");
+      writeFileSync(sessionFile, '{"type":"session","id":"abc"}\n');
+      writeFileSync(`${sessionFile}.ask`, JSON.stringify({ question: "Retry?" }));
+      const badPi = { sendMessage: () => { throw new Error("boom"); } };
+      const running = { name: "scout", agent: "scout", sessionFile, startTime: Date.now() };
+      assert.equal(testApi.deliverPendingQuestion(running, badPi), false);
+      assert.ok(existsSync(`${sessionFile}.ask`), "failed delivery must retry next tick");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("kept-tab lookup returns live tabs and prunes dead ones", () => {
+    const testApi = (subagentsModule as any).__test__;
+    assert.equal(typeof testApi.findKeptTab, "function");
+    const dir = createTestDir();
+    try {
+      const artifactDir = join(dir, "artifacts", "p1");
+      mkdirSync(artifactDir, { recursive: true });
+      const sessionFile = join(dir, "child.jsonl");
+      writeFileSync(sessionFile, '{"type":"session","id":"s1"}\n');
+      writeFileSync(
+        join(artifactDir, "subagent-registry.json"),
+        JSON.stringify({ w: { sessionFile, sessionId: "s1", surface: "99" } }),
+      );
+      (testApi.keptTabs as Map<string, any>).set(testApi.keptKey(artifactDir, "w"), {
+        name: "w", surface: "99", sessionFile, sessionId: "s1",
+        parentArtifactDir: artifactDir, abort: new AbortController(),
+      });
+      assert.ok(testApi.findKeptTab(artifactDir, "w", () => true), "live tab resolves");
+      assert.equal(testApi.findKeptTab(artifactDir, "w", () => false), null, "dead tab prunes");
+      assert.ok(!(testApi.keptTabs as Map<string, any>).has(testApi.keptKey(artifactDir, "w")));
+      const reg = JSON.parse(readFileSync(join(artifactDir, "subagent-registry.json"), "utf8"));
+      assert.ok(!reg.w.surface, "stale surface cleared so resume is allowed");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("recovers orphaned .ask files on session start (dead watcher)", () => {
+    const testApi = (subagentsModule as any).__test__;
+    assert.equal(typeof testApi.recoverPendingQuestions, "function");
+    const dir = createTestDir();
+    try {
+      const artifactDir = join(dir, "artifacts", "parent1");
+      mkdirSync(artifactDir, { recursive: true });
+      const sessionFile = join(dir, "child.jsonl");
+      writeFileSync(sessionFile, '{"type":"session","id":"sess-child"}\n');
+      writeFileSync(`${sessionFile}.ask`, JSON.stringify({ question: "Orphaned?" }));
+      writeFileSync(
+        join(artifactDir, "subagent-registry.json"),
+        JSON.stringify({ "my-worker": { sessionFile, sessionId: "sess-child" } }),
+      );
+      const sent: any[] = [];
+      testApi.recoverPendingQuestions({ sendMessage: (m: any, o: any) => { sent.push({ m, o }); } }, artifactDir);
+      assert.equal(sent.length, 1);
+      assert.equal(sent[0].m.customType, "subagent_question");
+      assert.ok(!existsSync(`${sessionFile}.ask`), "recovery consumes the file");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
 describe("subagents widget rendering", () => {
   it("keeps every rendered line within a very narrow width", () => {
     const testApi = (subagentsModule as any).__test__;

@@ -60,13 +60,33 @@ never read, and explicitly scrubbed:
   then the `__SUBAGENT_DONE_<code>__` terminal sentinel. `.done` only ever
   appears on keep runs.
 
+## Kept tabs stay supervised (second life after `.done`)
+
+The spawn watcher exits on the first `.done`, but the tab is still alive and
+interactive — the user (or the agent) can keep working there and call
+`ask_question` again. A second lightweight monitor (`monitorKeptTab`) starts
+when the first result is delivered:
+
+- Relays later `.ask` signals live (same `subagent_question` steer).
+- Reports a later agent-loop error (`.exit`) as a failure result.
+- Ends silently when the tab closes (clears the registry `surface` so a later
+  resume is allowed).
+- Re-attaches on `session_start` from registry entries whose tab is still
+  alive, so kept tabs survive `/reload` too.
+
+## Messaging a kept tab
+
+`subagent_message({ name, message })` routes running → kept (steer text into
+the live tab, same process — safe) → resume relaunch. A kept tab is one live
+pi process, so steering into it is exactly like steering a running subagent.
+Only a *relaunch* is refused while the tab is alive (two pi processes must
+never append to one `.jsonl`); close the tab and retry for that case.
+
 ## Resume
 
 `subagent_message({ name })` resume is always autonomous (`autoExit: true`), so
 per the table it **always exits** — even with `tabs.keepOpen: true`. Resume
 always sets `PI_SUBAGENT_AUTO_EXIT=1`, never keeps, stores `keepSurface: false`.
-Resume still refuses while the kept tab is alive (two pi processes must never
-share one `.jsonl`); close the tab and retry.
 
 ## Deferred exit (unchanged)
 

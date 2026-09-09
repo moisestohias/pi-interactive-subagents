@@ -8,11 +8,41 @@ import {
   readdirSync,
   readFileSync,
   writeFileSync,
+  appendFileSync,
   existsSync,
   mkdirSync,
   copyFileSync,
   unlinkSync,
 } from "node:fs";
+
+/**
+ * File trace for the ask_question / subagent_message round-trip.
+ * Live delivery failures leave no UI trace (the watcher just never fires),
+ * so every step appends one line to /tmp/pi-subagents-debug.log:
+ * watcher start/tick/end, .ask seen, sendMessage outcome, steer outcome.
+ * Volume is ~1 line/sec per running subagent while a watch is active.
+ * Disable with PI_SUBAGENTS_DEBUG=0.
+ */
+function debugLog(...args: unknown[]): void {
+  try {
+    if (process.env.PI_SUBAGENTS_DEBUG === "0") return;
+    const line =
+      `[${new Date().toISOString()} pid=${process.pid}] ` +
+      args
+        .map((a) => {
+          if (typeof a === "string") return a;
+          try {
+            return JSON.stringify(a);
+          } catch {
+            return String(a);
+          }
+        })
+        .join(" ");
+    appendFileSync("/tmp/pi-subagents-debug.log", line + "\n");
+  } catch {
+    // Logging must never break the extension.
+  }
+}
 import { homedir } from "node:os";
 import {
   isMuxAvailable,
@@ -686,6 +716,145 @@ interface RunningSubagent {
 /** All currently running subagents, keyed by id. */
 const runningSubagents = new Map<string, RunningSubagent>();
 
+/**
+ * Kept-open tabs that outlived their first result (config `tabs.keepOpen` +
+ * agent `auto-exit:false` → `.done` consumed, pi still interactive in the tab).
+ * The spawn watcher is gone, but the session can still `ask_question` later
+ * (e.g. after manual follow-ups in the tab) and can still be steered — typing
+ * into the live tab addresses the SAME pi process, so unlike resume there is
+ * no double-open hazard. Keyed by spawner-artifact-dir + name (names are only
+ * unique per spawner session; the process may host several sessions).
+ */
+interface KeptTab {
+  name: string;
+  agent?: string;
+  surface: string;
+  sessionFile: string;
+  sessionId: string | null;
+  parentArtifactDir: string;
+  abort: AbortController;
+}
+const keptTabs = new Map<string, KeptTab>();
+
+function keptKey(artifactDir: string, name: string): string {
+  return `${artifactDir}::${name}`;
+}
+
+/** Find a kept tab for this spawner session by name (prunes it if its tab died). */
+function findKeptTab(
+  artifactDir: string,
+  name: string,
+  exists: (surface: string) => boolean = windowExists,
+): KeptTab | null {
+  const kept = keptTabs.get(keptKey(artifactDir, name));
+  if (!kept) return null;
+  let alive = false;
+  try {
+    alive = exists(kept.surface);
+  } catch {
+    alive = false;
+  }
+  if (!alive) {
+    keptTabs.delete(keptKey(artifactDir, name));
+    try {
+      kept.abort.abort();
+    } catch {}
+    // Clear the stale surface so a later resume is allowed.
+    try {
+      const reg = readNameRegistry(artifactDir);
+      if (reg[name]?.surface) {
+        registerName(artifactDir, name, {
+          sessionFile: kept.sessionFile,
+          sessionId: kept.sessionId,
+        });
+      }
+    } catch {}
+    return null;
+  }
+  return kept;
+}
+
+/**
+ * Watch a kept tab until it closes: relay later `ask_question` signals live
+ * (the spawn watcher already exited on the first `.done`) and report a later
+ * agent-loop error via `.exit`. The first result was already delivered — a
+ * clean close afterwards is silent. Aborted on session shutdown / tab death.
+ */
+async function monitorKeptTab(kept: KeptTab, piInstance: ExtensionAPI): Promise<void> {
+  debugLog("kept:monitor-start", kept.name, `surface=${kept.surface}`);
+  try {
+    const result = await pollForExit(
+      kept.surface,
+      AbortSignal.any([kept.abort.signal, getModuleAbortSignal()]),
+      {
+        interval: 2000,
+        sessionFile: kept.sessionFile,
+        onTick() {
+          try {
+            deliverPendingQuestion(
+              { name: kept.name, agent: kept.agent, sessionFile: kept.sessionFile, startTime: Date.now() },
+              piInstance,
+            );
+          } catch (err: any) {
+            debugLog("kept:deliver-threw", kept.name, err?.message ?? String(err));
+          }
+        },
+      },
+    );
+    if (result.reason === "error") {
+      debugLog("kept:error", kept.name, result.errorMessage ?? "");
+      try {
+        piInstance.sendMessage(
+          {
+            customType: "subagent_result",
+            content:
+              `Sub-agent "${kept.name}" failed in its kept tab ` +
+              `(provider/agent error — auto-retry exhausted).\n\nError: ${result.errorMessage ?? "unknown"}`,
+            display: true,
+            details: { name: kept.name, errorMessage: result.errorMessage ?? "unknown" },
+          },
+          { triggerTurn: true, deliverAs: "steer" },
+        );
+      } catch (err: any) {
+        debugLog("kept:error-send-threw", kept.name, err?.message ?? String(err));
+      }
+    } else {
+      debugLog("kept:tab-closed", kept.name);
+    }
+  } catch (err: any) {
+    debugLog("kept:monitor-end", kept.name, err?.message ?? String(err));
+  } finally {
+    keptTabs.delete(keptKey(kept.parentArtifactDir, kept.name));
+    try {
+      const reg = readNameRegistry(kept.parentArtifactDir);
+      if (reg[kept.name]?.surface) {
+        registerName(kept.parentArtifactDir, kept.name, {
+          sessionFile: kept.sessionFile,
+          sessionId: kept.sessionId,
+        });
+      }
+    } catch {}
+  }
+}
+
+/** Register a kept tab and start its monitor (no-op if already tracked). */
+function trackKeptTab(
+  parentArtifactDir: string,
+  params: { name: string; agent?: string; surface: string; sessionFile: string; sessionId: string | null },
+  piInstance: ExtensionAPI,
+): void {
+  const key = keptKey(parentArtifactDir, params.name);
+  const prev = keptTabs.get(key);
+  if (prev) {
+    try {
+      prev.abort.abort();
+    } catch {}
+  }
+  const kept: KeptTab = { ...params, parentArtifactDir, abort: new AbortController() };
+  keptTabs.set(key, kept);
+  void monitorKeptTab(kept, piInstance);
+}
+
 // When this extension is loaded inside a subagent that itself spawns children
 // (e.g. a worker delegating to scout/researcher), `subagent-done.ts` runs in the
 // same process and needs to know whether this session still has children in
@@ -1091,13 +1260,16 @@ function handleSubagentSteer(
   const now = Date.now();
   observeRunningSubagent(running, now);
 
+  debugLog("steer:attempt", running.name, `surface=${running.surface}`, `len=${message.length}`);
   const steer = steerSubagent(running, message, send);
   if ("error" in steer) {
+    debugLog("steer:failed", running.name, steer.error);
     return {
       content: [{ type: "text" as const, text: steer.error }],
       details: { error: steer.error, id: running.id, name: running.name },
     };
   }
+  debugLog("steer:sent", running.name, `surface=${running.surface}`);
 
   running.statusState = forceStatusAfterInterrupt(running.statusState, now);
   updateWidget();
@@ -1199,6 +1371,11 @@ export const __test__ = {
   handleSubagentSteer,
   resolveResultPresentation,
   resolveResumeLaunchBehavior,
+  deliverPendingQuestion,
+  recoverPendingQuestions,
+  findKeptTab,
+  keptKey,
+  keptTabs,
   runningSubagents,
   formatElapsed,
   formatTokens,
@@ -1563,46 +1740,116 @@ function copyClaudeSession(sentinelFile: string): string | null {
  * multiple subagents are delivered independently. The file is deleted after
  * delivery so it fires once per question (a subagent may ask again later).
  */
-function deliverPendingQuestion(running: RunningSubagent): void {
+type QuestionCarrier = Pick<RunningSubagent, "name" | "agent" | "sessionFile" | "startTime">;
+
+/**
+ * Re-deliver any orphaned `.ask` files left by watchers that died with their
+ * parent process (pi exit / `/reload` aborts every watcher). Without this, a
+ * question asked while the parent was reloading is lost forever: the live
+ * tick that would have picked it up is gone, and no new watcher starts for
+ * the old run. Runs on every `session_start` for this spawner session's own
+ * registry; delivery consumes the file so a racing live watcher can't double-fire.
+ */
+function recoverPendingQuestions(piInstance: ExtensionAPI, artifactDir: string): void {
+  let registry;
+  try {
+    registry = readNameRegistry(artifactDir);
+  } catch {
+    return;
+  }
+  for (const [name, entry] of Object.entries(registry)) {
+    const sessionFile = (entry as { sessionFile?: unknown }).sessionFile;
+    if (typeof sessionFile !== "string" || !sessionFile) continue;
+    let askExists = false;
+    try {
+      askExists = existsSync(`${sessionFile}.ask`);
+    } catch {
+      continue;
+    }
+    if (!askExists) continue;
+    debugLog("recover:found", name, sessionFile);
+    let agent: string | undefined;
+    try {
+      agent = readSubagentLoadout(sessionFile)?.agent ?? undefined;
+    } catch {
+      agent = undefined;
+    }
+    deliverPendingQuestion({ name, agent, sessionFile, startTime: Date.now() }, piInstance);
+  }
+}
+
+function deliverPendingQuestion(running: QuestionCarrier, piInstance?: ExtensionAPI | null): boolean {
   const askFile = `${running.sessionFile}.ask`;
+  let askExists = false;
+  try {
+    askExists = existsSync(askFile);
+  } catch {}
+  if (!askExists) return false;
+  debugLog("ask:tick-seen", running.name, askFile);
   let payload: any = null;
   try {
-    if (!existsSync(askFile)) return;
     payload = JSON.parse(readFileSync(askFile, "utf-8"));
-  } catch {
+  } catch (err: any) {
     // Malformed/partway-written file — drop it and move on.
+    debugLog("ask:unparseable", running.name, err?.message ?? String(err));
+    try {
+      unlinkSync(askFile);
+    } catch {}
+    return false;
   }
-  try {
-    unlinkSync(askFile);
-  } catch {}
-  if (!payload?.question) return;
+  if (!payload?.question) {
+    debugLog("ask:no-question-field", running.name);
+    try {
+      unlinkSync(askFile);
+    } catch {}
+    return false;
+  }
+
+  // Use the spawner's own pi instance (threaded from the spawn call site).
+  // The module-global latestPi can point at a different session (multi-session
+  // process, /reload) — results already use the closure pi, questions must too.
+  const target = piInstance ?? latestPi;
+  if (!target) return false; // no session to notify — keep the file for retry
 
   const name = running.name; // unique per session (deduped at spawn) — targets the reply
   const sessionId = existsSync(running.sessionFile) ? getSessionId(running.sessionFile) : null;
   const elapsed = Math.floor((Date.now() - running.startTime) / 1000);
   const replyHint = `\n\nReply with subagent_message({ name: "${name}", message: "…" }) — the same name works whether it is still running or has since exited. It stays open until you reply.`;
 
-  latestPi?.sendMessage(
-    {
-      customType: "subagent_question",
-      content: `Sub-agent "${name}" asks (${formatElapsed(elapsed)}):\n\n${payload.question}${replyHint}`,
-      display: true,
-      details: {
-        name,
-        agent: running.agent,
-        question: payload.question,
-        ...(sessionId ? { sessionId } : {}),
+  try {
+    debugLog("ask:sending", name, `hasExplicitPi=${!!piInstance}`, `hasLatestPi=${!!latestPi}`);
+    target.sendMessage(
+      {
+        customType: "subagent_question",
+        content: `Sub-agent "${name}" asks (${formatElapsed(elapsed)}):\n\n${payload.question}${replyHint}`,
+        display: true,
+        details: {
+          name,
+          agent: running.agent,
+          question: payload.question,
+          ...(sessionId ? { sessionId } : {}),
+        },
       },
-    },
-    { triggerTurn: true, deliverAs: "steer" },
-  );
+      { triggerTurn: true, deliverAs: "steer" },
+    );
+    debugLog("ask:sent", name);
+  } catch (err: any) {
+    debugLog("ask:send-threw", name, err?.message ?? String(err));
+    return false; // keep the file — retry on the next tick
+  }
+  try {
+    unlinkSync(askFile);
+  } catch {}
+  return true;
 }
 
 async function watchSubagent(
   running: RunningSubagent,
   signal: AbortSignal,
+  piInstance?: ExtensionAPI | null,
 ): Promise<SubagentResult> {
   const { name, task, surface, startTime, sessionFile } = running;
+  debugLog("watch:start", name, sessionFile, `surface=${surface}`, `hasPi=${!!piInstance}`);
 
   try {
     const result = await pollForExit(surface, AbortSignal.any([signal, getModuleAbortSignal()]), {
@@ -1610,10 +1857,19 @@ async function watchSubagent(
       sessionFile,
       sentinelFile: running.sentinelFile,
       onTick() {
-        observeRunningSubagent(running);
-        deliverPendingQuestion(running);
+        try {
+          observeRunningSubagent(running);
+        } catch (err: any) {
+          debugLog("watch:observe-threw", name, err?.message ?? String(err));
+        }
+        try {
+          deliverPendingQuestion(running, piInstance);
+        } catch (err: any) {
+          debugLog("watch:deliver-threw", name, err?.message ?? String(err));
+        }
       },
     });
+    debugLog("watch:exit-seen", name, result.reason, `code=${result.exitCode}`);
 
     const elapsed = Math.floor((Date.now() - startTime) / 1000);
 
@@ -1691,6 +1947,7 @@ async function watchSubagent(
       ...(stats ? { stats } : {}),
     };
   } catch (err: any) {
+    debugLog("watch:ended-with-error", name, err?.message ?? String(err));
     try {
       // Aborts mean this session is going away (shutdown/reload) — always
       // clean up. Genuine errors honor this run's keep decision for inspection.
@@ -1734,6 +1991,49 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     if (!prevAbort || prevAbort.signal.aborted) {
       (globalThis as any)[POLL_ABORT_KEY] = new AbortController();
     }
+    // Catch up on questions orphaned by a dead watcher (pi exit / `/reload`
+    // while a subagent was parked on ask_question). The live tick is gone;
+    // without this the `.ask` file sits unconsumed forever.
+    // Also re-attach monitors + steer routing for kept tabs still alive.
+    try {
+      const mgr = (ctx as any)?.sessionManager;
+      if (mgr?.getSessionDir && mgr?.getSessionId) {
+        const artifactDir = getArtifactDir(mgr.getSessionDir(), mgr.getSessionId());
+        recoverPendingQuestions(pi, artifactDir);
+        try {
+          const registry = readNameRegistry(artifactDir);
+          for (const [regName, regEntry] of Object.entries(registry)) {
+            const sf = (regEntry as { sessionFile?: unknown }).sessionFile;
+            const surf = (regEntry as { surface?: unknown }).surface;
+            if (typeof sf !== "string" || !sf || typeof surf !== "string" || !surf) continue;
+            if (keptTabs.has(keptKey(artifactDir, regName))) continue;
+            let alive = false;
+            try {
+              alive = existsSync(sf) && windowExists(surf);
+            } catch {
+              alive = false;
+            }
+            if (!alive) continue;
+            let agent: string | undefined;
+            try {
+              agent = readSubagentLoadout(sf)?.agent ?? undefined;
+            } catch {
+              agent = undefined;
+            }
+            debugLog("kept:reattach", regName, `surface=${surf}`);
+            trackKeptTab(
+              artifactDir,
+              { name: regName, agent, surface: surf, sessionFile: sf, sessionId: (regEntry as { sessionId?: string }).sessionId ?? null },
+              pi,
+            );
+          }
+        } catch {
+          // Best effort — rebuild must never break session startup.
+        }
+      }
+    } catch {
+      // Best effort — a failed scan must never break session startup.
+    }
   });
 
   // Clean up on session shutdown
@@ -1754,6 +2054,12 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       agent.abortController?.abort();
     }
     runningSubagents.clear();
+    for (const kept of keptTabs.values()) {
+      try {
+        kept.abort.abort();
+      } catch {}
+    }
+    keptTabs.clear();
   });
 
   // The spawning tools are always registered here. Whether a child process can
@@ -1904,8 +2210,9 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         startWidgetRefresh();
         startStatusRefresh(pi);
 
-        // Fire-and-forget: start watching in background
-        watchSubagent(running, watcherAbort.signal)
+        // Fire-and-forget: start watching in background (thread spawner's pi
+        // so ask_question delivery goes to the right session, not latestPi).
+        watchSubagent(running, watcherAbort.signal, pi)
           .then((result) => {
             updateWidget(); // reflect removal from Map immediately
 
@@ -1916,6 +2223,24 @@ export default function subagentsExtension(pi: ExtensionAPI) {
               sessionId: result.sessionId ?? null,
               ...(result.surfaceKept ? { surface: running.surface } : {}),
             });
+
+            // Kept tab outlives this watcher: keep relaying later
+            // ask_question signals and allow steering into the live tab.
+            // Without this, questions asked after manual follow-ups in the
+            // kept tab sit orphaned until the next /reload recovery.
+            if (result.surfaceKept) {
+              trackKeptTab(
+                parentArtifactDir,
+                {
+                  name: running.name,
+                  agent: running.agent,
+                  surface: running.surface,
+                  sessionFile: running.sessionFile,
+                  sessionId: result.sessionId ?? null,
+                },
+                pi,
+              );
+            }
 
             const presentation =
               resolveResultPresentation(result, running.name) +
@@ -2220,14 +2545,39 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           }
         }
 
-        // Refuse to double-open a session that is still alive in a kept tab:
-        // two pi processes appending to one .jsonl corrupts it. The tab is
-        // interactive — follow up by typing there, or close it and retry.
-        if (entry.surface && windowExists(entry.surface)) {
-          const err =
-            `Subagent "${requestedName}" is still open in its kept tab. ` +
-            `Type your follow-up directly in that tab, or close the tab and retry.`;
-          return { content: [{ type: "text" as const, text: err }], details: { error: err } };
+        // A kept tab is still ONE live pi process: steer the reply into it
+        // (same safe path as steering a running subagent). Only refuse a
+        // resume relaunch while the tab is alive — two pi processes must never
+        // append to one .jsonl.
+        if (entry.surface) {
+          const kept = findKeptTab(parentArtifactDir, requestedName);
+          if (kept) {
+            debugLog("steer:kept-attempt", requestedName, `surface=${kept.surface}`);
+            const steer = steerSubagent(
+              { surface: kept.surface, name: kept.name } as RunningSubagent,
+              params.message,
+            );
+            if ("error" in steer) {
+              debugLog("steer:kept-failed", requestedName, steer.error);
+            } else {
+              debugLog("steer:kept-sent", requestedName, `surface=${kept.surface}`);
+              return {
+                content: [{
+                  type: "text" as const,
+                  text:
+                    `Message delivered to "${requestedName}" in its kept tab. It picks this up at its next ` +
+                    `turn boundary.` ,
+                }],
+                details: { name: requestedName, status: "steered-kept" },
+              };
+            }
+          }
+          if (windowExists(entry.surface)) {
+            const err =
+              `Subagent "${requestedName}" is still open in its kept tab. ` +
+              `Type your follow-up directly in that tab, or close the tab and retry.`;
+            return { content: [{ type: "text" as const, text: err }], details: { error: err } };
+          }
         }
 
         // A new watcher is starting: drop completion sidecars from any earlier
@@ -2373,7 +2723,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         const watcherAbort = new AbortController();
         running.abortController = watcherAbort;
 
-        watchSubagent(running, watcherAbort.signal)
+        watchSubagent(running, watcherAbort.signal, pi)
           .then((result) => {
             updateWidget();
 
