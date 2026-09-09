@@ -90,15 +90,21 @@ Path: child recorder (`activity.ts` in child process) → `subagent-activity/<id
 Path: child `ask_question` tool (`subagent-done.ts`) → `${sessionFile}.ask` → parent `deliverPendingQuestion()` on every `pollForExit.onTick` → `subagent_question` steer → parent replies via `subagent_message`.
 
 - Child sets `awaitingAnswer = true` (suppresses auto-exit for that turn), records `askQuestion()` (phase → `waiting`), writes `.ask` = `{name, agent, question}`.
-- Parent's watcher tick sees the file, deletes it (fires once per question), and sends `pi.sendMessage({customType: "subagent_question", content, details: {name, agent, question, sessionId?}}, {triggerTurn: true, deliverAs: "steer"})`. Parallel questions work (one file per session).
+- Parent's watcher tick sees the file and sends `pi.sendMessage({customType: "subagent_question", content, details: {name, agent, question, sessionId?}}, {triggerTurn: true, deliverAs: "steer"})`, deleting the file only after a successful send (fires once per question; a failed send is retried next tick). Parallel questions work (one file per session).
+
+> Update (2026-09): the tick carries the spawner's own `pi` instance (the module-global `latestPi` could address the
+> wrong session), and kept tabs (§11) get a second monitor after the first `.done`, so questions asked after manual
+> follow-ups in a kept tab are still delivered live. Orphan `.ask` files are also recovered on `session_start`.
+> Details: `ASK-QUESTION-FINDINGS.md`, `LIFECYCLE-LESSONS.md`.
 - The reply arrives as the child's next turn (see flow 5); `awaitingAnswer` clears on `input` (covers mid-turn steer absorption) and `agent_start` (covers fresh turns). If never answered, the surface stays open. **Fully mux-agnostic.**
 
 ### Flow 5 — Parent → child: `subagent_message` (steer running / resume finished)
 
-Same tool, two branches keyed by display `name`:
+Same tool, three branches keyed by display `name` (the third was added 2026-09; see §11 and `LIFECYCLE-LESSONS.md`):
 
 - **Running → steer:** `handleSubagentSteer()` → `observeRunningSubagent()` → `steerSubagent()` types the message into the live surface (**newlines flattened to spaces** — each newline would submit a partial turn in the child's TUI editor), then `forceStatusAfterInterrupt()` + widget update. Returns an immediate ack; **no new result is emitted** — completion still arrives via flow 2. **This is the second mux-dependent primitive** (`send-keys -l` + `Enter`).
-- **Finished → resume:** resolve `name` in `subagent-registry.json` → refuse if unknown/session-file-gone/no-`.loadout.json` (never relaunch unrestricted) → guard against double-running the same `.jsonl` → `createSurface()` a fresh surface → `pi --session <existingFile> -e <subagent-done.ts>` + `applySandboxToParts(loadout)` + `@<resume-msg.md>` + resume env prefix (`PI_SUBAGENT_*` replayed from snapshot, always autonomous `autoExit: true`) → register under the **same name**, watch with `entryCountBefore` so only new entries become the summary → result delivered as flow 2. Mux use = same create/type primitives as flow 1.
+- **Kept open → steer into the live tab:** same `send-text` path as running (one live pi process — safe). Only a *relaunch* is refused while the tab lives.
+- **Finished → resume:** resolve `name` in `subagent-registry.json` → refuse if unknown/session-file-gone/no-`.loadout.json` (never relaunch unrestricted) → guard against double-running the same `.jsonl` → refuse a relaunch while the kept tab is alive → `createSurface()` a fresh surface → `pi --session <existingFile> -e <subagent-done.ts>` + `applySandboxToParts(loadout)` + `@<resume-msg.md>` + resume env prefix (`PI_SUBAGENT_*` replayed from snapshot, always autonomous `autoExit: true`) → register under the **same name**, watch with `entryCountBefore` so only new entries become the summary → result delivered as flow 2. Mux use = same create/type primitives as flow 1.
 
 ### Flow 6 — Ambient / orthogonal signals
 
@@ -157,6 +163,11 @@ Splits later (if wanted): `launch --type=window --location=hsplit|vsplit|split -
 
 - Launch/resume **command builders** (`applySandboxToParts`, `buildPiPromptArgs`, env prefixes, artifact paths, `cd` prefixes, `; echo '__SUBAGENT_DONE_'$?'__'` sentinel suffix) — the child shell sees the same bytes.
 - `session.ts` (seeding, registry, loadouts, stats), `activity.ts` (recorder/reader + `wrong-id` validation), `status.ts` (classification/transitions), `subagent-done.ts` (auto-exit, `.exit`, `ask_question`), `safe-bash.ts`, Claude plugin hooks.
+
+> Update (2026-09): §4's premise — orchestrator files moving over untouched — no longer holds. Since migration:
+> `index.ts` gained per-run keep decisions, kept-tab monitors + steer routing, threaded delivery handles, and the
+> `tools`-baseline/`subagent_agents` boolean gate; `subagent-done.ts` dropped the `PI_SUBAGENT_KEEP_TAB` wire.
+> See §12 for the follow-on ledger.
 - `pi.sendMessage` steer flows + all three message renderers (`subagent_result/_status/_question`), widget rendering, `/subagent` command, `PI_SUBAGENT_SHELL_READY_DELAY_MS` delay (still needed — a fresh tab's shell needs the same settle time).
 - `RunningSubagent` shape — only the `surface` string contents change (`%12` → e.g. `18`).
 
@@ -360,3 +371,27 @@ so always exits) refuses while the kept tab is alive (two pi processes must neve
 share one `.jsonl`) — the kept window id is persisted in the name-registry entry
 (`surface?`), so the guard survives restarts; stale sidecars are cleared at resume
 start; aborts (shutdown/reload) always close tabs.
+
+## 12. Evolved since §9 (follow-on ledger, 2026-09)
+
+§§1–8 above are the pre-migration record and intentionally read stale in places
+(test counts, "untouched" files, two-branch messaging). The living contracts are
+`EXIT-KEEP-PRECEDENCE.md` (exit/keep rule), `LIFECYCLE-LESSONS.md` (supervision
+rules), and `ASK-QUESTION-FINDINGS.md` (the kept-tab round-trip incident). In order:
+
+1. **Exit/keep precedence + `PI_SUBAGENT_KEEP_TAB` removal.** `tabs.keepOpen`
+   (global) × `auto-exit` (per-agent): only `keepOpen && !auto-exit` keeps the tab.
+   The env wire is gone — scrubbed from launch commands, deleted if inherited.
+2. **Kept-tab supervision.** Spawn watchers exit on the first `.done`; a second
+   monitor (`monitorKeptTab`) relays later `.ask`/`.exit` until the tab closes,
+   re-attaches on `session_start`, and aborts on shutdown. Messaging is now
+   running → kept (steer) → resume relaunch.
+3. **Delivery hardening.** Spawner-`pi` threading (no `latestPi` reliance),
+   send-then-delete `.ask` with retry, orphan recovery on `session_start`.
+4. **`subagent_agents` boolean gate.** Missing/empty/`false` = no spawning;
+   `true` = spawn any; list = spawn only those.
+5. **Header-less tool baseline.** No `tools` header now resolves to
+   `read,write,edit,bash` + `ask_question` (+ spawning tools only via the gate)
+instead of an unrestricted child.
+6. **Diagnosis tracing added then removed** once regression tests pinned the fix
+   (see `LIFECYCLE-LESSONS.md` §7).

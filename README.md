@@ -28,12 +28,13 @@ export PI_SUBAGENT_SHELL_READY_DELAY_MS=2500   # default: 500
 To leave finished sub-agent tabs open instead of closing them, set `tabs.keepOpen` in `config.json` (see
 [configuration](#status-widget--configuration)).
 
-With it on, the worker's pi session **stays open and interactive** after finishing its task — the tab is not
+With it on (and an agent with `auto-exit: false`), the worker's pi session **stays open and interactive** after finishing its task — the tab is not
 just left behind, pi itself keeps running there. The run still completes normally from the orchestrator's side
 (widget counter drops, result is steered back once, completion message notes the open tab). After that, follow
-up by typing directly in the kept tab. `subagent_message` to that name is refused while its tab is alive (two pi
-processes must never share one session file) — close the tab and retry if you want a resumed run instead.
-Aborted runs (session shutdown/reload) always clean up their tabs. Applies on `/reload`, no pi restart needed.
+up by typing directly in the kept tab — or via `subagent_message`, which steers into the live tab. Only relaunching
+that session while its tab is alive is refused (two pi processes must never share one session file) — close the tab
+and retry if you want a resumed run instead. Later `ask_question` calls from the kept tab still reach you (see
+`docs/EXIT-KEEP-PRECEDENCE.md`). Aborted runs (session shutdown/reload) always clean up their tabs. Applies on `/reload`, no pi restart needed.
 
 ## Tools
 
@@ -70,6 +71,7 @@ subagent_message({ name: "scout", message: "Also check the auth middleware" });
 ```
 
 - **Running** — the message is sent to the live tab only (`send-text` addressed by window id, newlines flattened) and picked up at the next turn boundary. The call returns immediately; the eventual completion still arrives as a steer message.
+- **Kept open** (`tabs.keepOpen` + `auto-exit: false`, first result already delivered) — the message is steered into the live tab the same way. Only *relaunching* that session is refused while its tab is alive; close the tab and retry for a resumed run.
 - **Finished** — the session is resumed with the message as the follow-up task, like a fresh spawn: fire-and-forget, always autonomous, result steered back later. The resumed run reclaims its original name.
 
 Every spawn records name → session file in `artifacts/<sessionId>/subagent-registry.json`, so names stay addressable across pi restarts. A nested sub-agent that spawns children gets its own registry keyed by its own session id. Resume is refused with a clear error (listing known names) if the name isn't registered, the session file is gone, or the session predates sandboxed resume.

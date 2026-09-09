@@ -70,9 +70,11 @@ never consumed by any live watcher).
 
 ## Open notes
 
-- `~/.pi/agent/agents/worker.md` (`auto-exit: false`) shadows the bundled worker
-  (`auto-exit: true`); with `keepOpen: true` that global override means workers
-  keep tabs open. Pre-existing local config, unrelated to this fix — flagging
-  because it changes which table row workers land on.
+- At the time of writing, `~/.pi/agent/agents/worker.md` shadowed the bundled
+  worker. Its current headers (`auto-exit: false`, `system-prompt: replace`,
+  `subagent_agents: true`) mean: with `keepOpen: true` workers land on the KEEP
+  row (tabs stay open), run with a replaced system prompt, and may spawn any
+  agent. Pre-existing local config, unrelated to this fix — flagging because it
+  changes which precedence-table row, prompt mode, and spawn gate workers land on.
 - Temporary file tracing used during diagnosis is removed; the regression
   tests in `test/test.ts` (`ask_question delivery` suite) pin the fixed behavior.

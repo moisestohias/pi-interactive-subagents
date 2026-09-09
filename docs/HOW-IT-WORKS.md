@@ -32,9 +32,11 @@ The socket is mandatory: it keeps all plugin control traffic off your terminal. 
    - The tool returns instantly ("started"). A widget above your input now counts the running subagent.
 2. **Run.** The subagent works in its tab. A small activity file reports liveness (`active`, `waiting`, …), which
    drives the widget. Your session is fully usable meanwhile.
-3. **Finish.** The subagent's last message becomes its summary; its process exits. The plugin's watcher (which polls
-   for this) reads the summary from the session file, closes the tab, updates the widget **immediately**, and sends
-   you a `subagent_result` notification — this triggers a new turn so you can act on the result.
+3. **Finish.** The subagent's last message becomes its summary; its process exits — unless the run is kept open
+   (`tabs.keepOpen` in `config.json` plus `auto-exit: false` in the agent: session stays interactive, tab left
+   open; see `EXIT-KEEP-PRECEDENCE.md`). Either way the plugin's watcher reads the summary from the session file,
+   updates the widget **immediately**, and sends you a `subagent_result` notification — this triggers a new turn
+   so you can act on the result. Kept tabs stay supervised afterwards: later `ask_question` calls still reach you.
 4. **Follow up** (optional). The finished subagent stays addressable by name: `subagent_message({ name: "scout",
    message: "Also check the middleware" })` resumes that same session with the message as its next task, and the new
    result is delivered the same way.
@@ -44,10 +46,12 @@ instead of a silent fake completion.
 
 ## Talking to a running subagent
 
-`subagent_message({ name, message })` does two different things based on state — same name, no need to know which:
+`subagent_message({ name, message })` does three different things based on state — same name, no need to know which:
 
 - **Running** → the message is typed into the subagent's tab only (never your input) and picked up at its next turn.
   Returns an immediate ack; the eventual result still arrives as a notification.
+- **Kept open** (first result delivered, tab still alive) → steered into the live tab, same as running. Only a
+  *relaunch* is refused while the tab lives — close it and retry for that.
 - **Finished** → resumes the session (see step 4 above).
 
 A subagent can also ask *you* something first via its `ask_question` tool. Its session parks as `waiting`, you get a
@@ -69,7 +73,7 @@ agents additionally notify you; user-driven agents stay quiet (you're already lo
 | `ask_question` | subagent only | Ask the parent a question and wait for the reply |
 | `/subagent <agent> <task>` | human | Slash-command shortcut for spawning |
 
-Spawning is permissioned: every spawn must name a known agent, and a subagent may only spawn agents its own profile allows — so a child can never escalate into a full-toolset session.
+Spawning is permissioned: every spawn must name a known agent, and a subagent may only spawn what its `subagent_agents` profile field allows (`true` = any agent; a list = only those; missing/`false` = cannot spawn at all) — so a child can never escalate into a full-toolset session. Agents without a `tools` header run with a `read, write, edit, bash` baseline (`ask_question` always added).
 
 ## How the pieces fit (files)
 
