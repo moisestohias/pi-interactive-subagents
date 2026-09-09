@@ -504,20 +504,49 @@ function getShellReadyDelayMs(): number {
   return Number.isFinite(parsed) && parsed >= 0 ? parsed : 500;
 }
 
+// Legacy wire removed: `PI_SUBAGENT_KEEP_TAB` is no longer set, read, or
+// propagated anywhere. `tabs.keepOpen` in config.json is the sole source of
+// truth (reloaded on pi's /reload). Any value lingering in the shell env
+// (dotfiles, old exports) is scrubbed at launch and ignored in the child.
+if ("PI_SUBAGENT_KEEP_TAB" in process.env) {
+  delete process.env.PI_SUBAGENT_KEEP_TAB;
+}
+
 /**
- * Whether finished subagent tabs stay open (with pi still interactive).
- * Decided by `tabs.keepOpen` in config.json — the single source of truth,
- * reloaded on pi's /reload. `PI_SUBAGENT_KEEP_TAB` is only the internal
- * parent→child wire for runs launched while this is on; user shell env is
- * never consulted.
+ * Exit/keep precedence (single source of truth: config.json + agent frontmatter).
+ *
+ *   keepOpen (config.json, global) × autoExit (agent.md `auto-exit`, per-agent):
+ *     keepOpen=false + autoExit=*     → EXIT  (global takes precedence)
+ *     keepOpen=true  + autoExit=true  → EXIT  (agent wants to close)
+ *     keepOpen=true  + autoExit=false → KEEP  (both agree to stay open)
+ *
+ * In short: keep ⇔ (keepOpen && !autoExit); exit ⇔ !keep.
+ * The parent encodes the exit side into `PI_SUBAGENT_AUTO_EXIT` and remembers
+ * the keep side per-run (`RunningSubagent.keepSurface`) for tab closing.
+ * Shell env is never consulted for keepOpen.
  */
 function shouldKeepSurface(): boolean {
   return tabsConfig.keepOpen === true;
 }
 
-/** Close a finished subagent's tab unless the user asked to keep it open. */
-function maybeCloseSurface(surface: string): void {
-  if (shouldKeepSurface()) return;
+/** Per-agent keep decision: only keep when config allows AND the agent opts out of auto-exit. */
+function shouldKeepSurfaceFor(autoExit: boolean): boolean {
+  return tabsConfig.keepOpen === true && autoExit !== true;
+}
+
+/** Per-agent keep decision from a loaded agent definition (missing def ⇒ autoExit=false). */
+function shouldKeepForAgent(agentDefs: AgentDefaults | null): boolean {
+  return tabsConfig.keepOpen === true && !(agentDefs?.autoExit ?? false);
+}
+
+/**
+ * Close a finished subagent's tab unless this specific run was kept open.
+ * Pass the run's `keepSurface` decision; when omitted, falls back to the
+ * global config (legacy call sites / tests).
+ */
+function maybeCloseSurface(surface: string, keepSurface?: boolean): void {
+  const keep = keepSurface ?? shouldKeepSurface();
+  if (keep) return;
   closeSurface(surface);
 }
 
@@ -614,7 +643,7 @@ interface SubagentResult {
   errorMessage?: string;
   /** Aggregate usage/model/tool stats parsed from the completed session file. */
   stats?: SessionStats;
-  /** True when the tab was left open (PI_SUBAGENT_KEEP_TAB) instead of closed. */
+  /** True when the tab was left open (config `tabs.keepOpen` + `auto-exit: false`) instead of closed. */
   surfaceKept?: boolean;
 }
 
@@ -640,6 +669,10 @@ interface RunningSubagent {
   abortController?: AbortController;
   cli?: string;
   sentinelFile?: string;
+  /** Per-run keep decision: keepOpen (config) && !autoExit (agent). True ⇒ leave tab open + pi interactive. */
+  keepSurface?: boolean;
+  /** Effective auto-exit sent to the child via PI_SUBAGENT_AUTO_EXIT (!keepSurface). */
+  autoExit?: boolean;
   statusState: SubagentStatusState;
   /**
    * When true, status transitions (stalled/recovered) do not wake the parent
@@ -1145,6 +1178,8 @@ export const __test__ = {
   borderLine,
   getShellReadyDelayMs,
   shouldKeepSurface,
+  shouldKeepSurfaceFor,
+  shouldKeepForAgent,
   renderSubagentWidgetLines,
   loadAgentDefaults,
   discoverAgentDefinitions,
@@ -1266,6 +1301,12 @@ async function launchSubagent(
   const fullTask = inheritsConversationContext
     ? params.task
     : `${roleBlock}\n\n${modeHint}\n\n${params.task}\n\n${summaryInstruction}`;
+  // Per-run exit/keep decision (config.json × agent frontmatter).
+  // keep ⇔ (keepOpen && !autoExit); exit ⇔ !keep. The exit side is encoded
+  // into PI_SUBAGENT_AUTO_EXIT; the keep side is remembered per-run for tab closing.
+  const agentAutoExit = agentDefs?.autoExit ?? false;
+  const keepSurface = tabsConfig.keepOpen === true && !agentAutoExit;
+  const effectiveAutoExit = !keepSurface;
   // ── Claude Code CLI path ──
   if (agentDefs?.cli === "claude") {
     const sentinelFile = `/tmp/pi-claude-${id}-done`;
@@ -1324,6 +1365,8 @@ async function launchSubagent(
       launchScriptFile,
       cli: "claude",
       sentinelFile,
+      keepSurface,
+      autoExit: effectiveAutoExit,
       interactive: effectiveInteractive,
       statusState: createStatusState({
         source: "claude",
@@ -1393,14 +1436,13 @@ async function launchSubagent(
   if (params.agent) {
     envParts.push(`PI_SUBAGENT_AGENT=${shellEscape(params.agent)}`);
   }
-  // Keep-open mode (config `tabs.keepOpen`) suppresses auto-exit so the
-  // session stays interactive, and passes the internal wire telling the
-  // child to report its first clean finish via `.done` instead.
-  if (agentDefs?.autoExit && !shouldKeepSurface()) {
+  // Exit/keep encoding (config.json is the sole truth for keepOpen; the legacy
+  // PI_SUBAGENT_KEEP_TAB wire is removed and scrubbed — see command prefix below).
+  // keepOpen=false forces exit even for `auto-exit: false` agents (global precedence).
+  // keepOpen=true delegates to the agent: auto-exit ⇒ close, otherwise stay open + `.done`.
+  // effectiveAutoExit ⇔ !keepSurface ⇔ (!keepOpen || agentAutoExit).
+  if (effectiveAutoExit) {
     envParts.push(`PI_SUBAGENT_AUTO_EXIT=1`);
-  }
-  if (shouldKeepSurface()) {
-    envParts.push(`PI_SUBAGENT_KEEP_TAB=1`);
   }
   envParts.push(`PI_SUBAGENT_SESSION=${shellEscape(subagentSessionFile)}`);
   envParts.push(`PI_SUBAGENT_ID=${shellEscape(id)}`);
@@ -1442,7 +1484,11 @@ async function launchSubagent(
   // This was already computed above so session placement, PI_CODING_AGENT_DIR, and cd agree.
   const cdPrefix = effectiveCwd ? `cd ${shellEscape(effectiveCwd)} && ` : "";
 
-  const piCommand = cdPrefix + envPrefix + parts.join(" ");
+  // Scrub the removed legacy wire: a user shell that still exports
+  // PI_SUBAGENT_KEEP_TAB (dotfiles / old sessions) would otherwise leak it
+  // into the child via shell inheritance. config.json stays the sole truth.
+  const scrubPrefix = "unset PI_SUBAGENT_KEEP_TAB; ";
+  const piCommand = scrubPrefix + cdPrefix + envPrefix + parts.join(" ");
   const command = `${piCommand}; echo '__SUBAGENT_DONE_'$?'__'`;
   const launchScriptName = `${(params.name || "subagent")
     .toLowerCase()
@@ -1471,6 +1517,8 @@ async function launchSubagent(
     sessionFile: subagentSessionFile,
     launchScriptFile,
     activityFile,
+    keepSurface,
+    autoExit: effectiveAutoExit,
     interactive: effectiveInteractive,
     statusState: createStatusState({
       source: "pi",
@@ -1599,10 +1647,10 @@ async function watchSubagent(
         try { unlinkSync(running.sentinelFile + ".transcript"); } catch {}
       }
 
-      maybeCloseSurface(surface);
+      maybeCloseSurface(surface, running.keepSurface);
       runningSubagents.delete(running.id);
 
-      return { name, task, summary, exitCode: result.exitCode, elapsed, surfaceKept: shouldKeepSurface(), ...(sessionId ? { claudeSessionId: sessionId } : {}) };
+      return { name, task, summary, exitCode: result.exitCode, elapsed, surfaceKept: running.keepSurface === true, ...(sessionId ? { claudeSessionId: sessionId } : {}) };
     }
 
     // Pi subagent result extraction
@@ -1627,7 +1675,7 @@ async function watchSubagent(
     const stats = existsSync(sessionFile) ? summarizeSessionStats(sessionFile) : null;
     const subagentSessionId = existsSync(sessionFile) ? getSessionId(sessionFile) : null;
 
-    maybeCloseSurface(surface);
+    maybeCloseSurface(surface, running.keepSurface);
     runningSubagents.delete(running.id);
 
     return {
@@ -1635,7 +1683,7 @@ async function watchSubagent(
       task,
       summary,
       sessionFile,
-      surfaceKept: shouldKeepSurface(),
+      surfaceKept: running.keepSurface === true,
       ...(subagentSessionId ? { sessionId: subagentSessionId } : {}),
       exitCode: result.exitCode,
       elapsed,
@@ -1645,9 +1693,9 @@ async function watchSubagent(
   } catch (err: any) {
     try {
       // Aborts mean this session is going away (shutdown/reload) — always
-      // clean up. Genuine errors honor keep-open for inspection.
+      // clean up. Genuine errors honor this run's keep decision for inspection.
       if (signal.aborted) closeSurface(surface);
-      else maybeCloseSurface(surface);
+      else maybeCloseSurface(surface, running.keepSurface);
     } catch {}
     runningSubagents.delete(running.id);
 
@@ -2264,11 +2312,11 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         resumeEnvParts.push(`PI_SUBAGENT_SESSION=${shellEscape(sessionPath)}`);
         resumeEnvParts.push(`PI_SUBAGENT_ID=${shellEscape(id)}`);
         resumeEnvParts.push(`PI_SUBAGENT_ACTIVITY_FILE=${shellEscape(activityFile)}`);
-        if (autoExit && !shouldKeepSurface()) {
+        // Resume is always autonomous (autoExit=true) ⇒ always exits, even when
+        // tabs.keepOpen is true (keep ⇔ keepOpen && !autoExit ⇔ false here).
+        // The legacy PI_SUBAGENT_KEEP_TAB wire is removed; config.json stays truth.
+        if (autoExit) {
           resumeEnvParts.push(`PI_SUBAGENT_AUTO_EXIT=1`);
-        }
-        if (shouldKeepSurface()) {
-          resumeEnvParts.push(`PI_SUBAGENT_KEEP_TAB=1`);
         }
         const resumeEnvPrefix = resumeEnvParts.join(" ") + " ";
 
@@ -2276,7 +2324,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         // operate where they did before.
         const resumeCdPrefix = loadout.cwd ? `cd ${shellEscape(loadout.cwd)} && ` : "";
 
-        const command = `${resumeCdPrefix}${resumeEnvPrefix}${parts.join(" ")}; echo '__SUBAGENT_DONE_'$?'__'`;
+        const command = `unset PI_SUBAGENT_KEEP_TAB; ${resumeCdPrefix}${resumeEnvPrefix}${parts.join(" ")}; echo '__SUBAGENT_DONE_'$?'__'`;
         const launchScriptFile = join(
           artifactDir,
           "subagent-scripts",
@@ -2299,6 +2347,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         });
 
         // Register as a running subagent for widget tracking
+        // Resume is always autonomous ⇒ keepSurface=false (always closes).
         const running: RunningSubagent = {
           id,
           name,
@@ -2308,6 +2357,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           sessionFile: sessionPath,
           launchScriptFile,
           activityFile,
+          keepSurface: false,
+          autoExit,
           interactive,
           statusState: createStatusState({
             source: "pi",

@@ -331,9 +331,9 @@ function interpretExitSidecar(data: any): PollResult {
 
 /**
  * Consume a completion sidecar next to the session file, if present.
- * `.exit` (error) wins over `.done` (clean finish with the session left
- * open via PI_SUBAGENT_KEEP_TAB). Returns null when neither exists.
- * Files are deleted on read so each signal fires once.
+ * `.exit` (error) wins over `.done` (clean finish on a keep-open run:
+ * config `tabs.keepOpen=true` + agent `auto-exit:false`, session left open).
+ * Returns null when neither exists. Files are deleted on read so each signal fires once.
  */
 function takeCompletionSidecar(sessionFile: string): PollResult | null {
   try {

@@ -1670,18 +1670,18 @@ describe("subagent-done.ts", () => {
 
   describe("ask_question tool", () => {
     function setupSubagentExtension(sessionFile: string) {
+      // Legacy PI_SUBAGENT_KEEP_TAB removed — never set; deleted if inherited.
       const saved = {
         session: process.env.PI_SUBAGENT_SESSION,
         name: process.env.PI_SUBAGENT_NAME,
         agent: process.env.PI_SUBAGENT_AGENT,
         autoExit: process.env.PI_SUBAGENT_AUTO_EXIT,
-        keepTab: process.env.PI_SUBAGENT_KEEP_TAB,
       };
       process.env.PI_SUBAGENT_SESSION = sessionFile;
       process.env.PI_SUBAGENT_NAME = "scout-2";
       process.env.PI_SUBAGENT_AGENT = "scout";
       process.env.PI_SUBAGENT_AUTO_EXIT = "1";
-      delete process.env.PI_SUBAGENT_KEEP_TAB;
+      delete (process.env as Record<string, string | undefined>).PI_SUBAGENT_KEEP_TAB;
       const mock = createMockExtensionApi();
       subagentDoneExtension(mock.api);
       const restore = () => {
@@ -1689,7 +1689,7 @@ describe("subagent-done.ts", () => {
         restoreEnvVar("PI_SUBAGENT_NAME", saved.name);
         restoreEnvVar("PI_SUBAGENT_AGENT", saved.agent);
         restoreEnvVar("PI_SUBAGENT_AUTO_EXIT", saved.autoExit);
-        restoreEnvVar("PI_SUBAGENT_KEEP_TAB", saved.keepTab);
+        delete (process.env as Record<string, string | undefined>).PI_SUBAGENT_KEEP_TAB;
       };
       return { mock, restore };
     }
@@ -1752,18 +1752,18 @@ describe("subagent-done.ts", () => {
         registerCommand() {}, registerMessageRenderer() {}, registerShortcut() {},
         sendUserMessage() {}, sendMessage() {}, getAllTools() { return []; },
       } as any;
+      // Legacy PI_SUBAGENT_KEEP_TAB removed — never set; deleted if inherited.
       const saved = {
         session: process.env.PI_SUBAGENT_SESSION,
         name: process.env.PI_SUBAGENT_NAME,
         agent: process.env.PI_SUBAGENT_AGENT,
         autoExit: process.env.PI_SUBAGENT_AUTO_EXIT,
-        keepTab: process.env.PI_SUBAGENT_KEEP_TAB,
       };
       process.env.PI_SUBAGENT_SESSION = sessionFile;
       process.env.PI_SUBAGENT_NAME = "scout-2";
       process.env.PI_SUBAGENT_AGENT = "scout";
       process.env.PI_SUBAGENT_AUTO_EXIT = "1";
-      delete process.env.PI_SUBAGENT_KEEP_TAB;
+      delete (process.env as Record<string, string | undefined>).PI_SUBAGENT_KEEP_TAB;
       subagentDoneExtension(api);
       const emit = (event: string, ...args: any[]) =>
         (handlers.get(event) ?? []).forEach((h) => h(...args));
@@ -1772,7 +1772,7 @@ describe("subagent-done.ts", () => {
         restoreEnvVar("PI_SUBAGENT_NAME", saved.name);
         restoreEnvVar("PI_SUBAGENT_AGENT", saved.agent);
         restoreEnvVar("PI_SUBAGENT_AUTO_EXIT", saved.autoExit);
-        restoreEnvVar("PI_SUBAGENT_KEEP_TAB", saved.keepTab);
+        delete (process.env as Record<string, string | undefined>).PI_SUBAGENT_KEEP_TAB;
       };
       const ask = async () => {
         const tool = tools.find((t) => t.name === "ask_question");
@@ -1837,15 +1837,17 @@ describe("subagent-done.ts", () => {
   });
 });
 
-describe("keep-open completion signal (PI_SUBAGENT_KEEP_TAB)", () => {
+// Keep-open runs are `!PI_SUBAGENT_AUTO_EXIT` (parent encodes
+// keepOpen=true + auto-exit:false into an unset AUTO_EXIT). The legacy
+// PI_SUBAGENT_KEEP_TAB wire is removed — setting it must have no effect.
+describe("keep-open completion signal (config keepOpen, no KEEP_TAB wire)", () => {
   function setupKeepOpen(sessionFile: string, opts?: { autoExit?: boolean }) {
     const saved = {
       session: process.env.PI_SUBAGENT_SESSION,
       autoExit: process.env.PI_SUBAGENT_AUTO_EXIT,
-      keepTab: process.env.PI_SUBAGENT_KEEP_TAB,
     };
     process.env.PI_SUBAGENT_SESSION = sessionFile;
-    process.env.PI_SUBAGENT_KEEP_TAB = "1";
+    delete (process.env as Record<string, string | undefined>).PI_SUBAGENT_KEEP_TAB;
     if (opts?.autoExit) process.env.PI_SUBAGENT_AUTO_EXIT = "1";
     else delete process.env.PI_SUBAGENT_AUTO_EXIT;
     const handlers = new Map<string, Array<(...args: any[]) => void>>();
@@ -1868,7 +1870,7 @@ describe("keep-open completion signal (PI_SUBAGENT_KEEP_TAB)", () => {
     const restore = () => {
       restoreEnvVar("PI_SUBAGENT_SESSION", saved.session);
       restoreEnvVar("PI_SUBAGENT_AUTO_EXIT", saved.autoExit);
-      restoreEnvVar("PI_SUBAGENT_KEEP_TAB", saved.keepTab);
+      delete (process.env as Record<string, string | undefined>).PI_SUBAGENT_KEEP_TAB;
     };
     return { emit, restore };
   }
@@ -1962,8 +1964,30 @@ describe("keep-open completion signal (PI_SUBAGENT_KEEP_TAB)", () => {
     }
   });
 
+  it("legacy PI_SUBAGENT_KEEP_TAB is scrubbed and ignored (only AUTO_EXIT matters)", () => {
+    // Regression: an old shell/dotfile exporting KEEP_TAB must not keep an
+    // auto-exit run open. The child deletes/ignores it; only AUTO_EXIT decides.
+    const dir = createTestDir();
+    try {
+      const sessionFile = join(dir, "s.jsonl");
+      const { emit, restore } = setupKeepOpen(sessionFile, { autoExit: true });
+      try {
+        (process.env as Record<string, string | undefined>).PI_SUBAGENT_KEEP_TAB = "1";
+        emit("agent_start");
+        let shutdown = false;
+        emit("agent_end", stopTurn(), { shutdown() { shutdown = true; } });
+        assert.equal(shutdown, true, "AUTO_EXIT=1 must exit even with legacy KEEP_TAB set");
+        assert.ok(!existsSync(`${sessionFile}.done`));
+      } finally {
+        restore();
+      }
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it("auto-exit still shuts down without .done when both flags are set", () => {
-    // The parent never sets both; documents precedence if it happens.
+    // Legacy case kept for precedence documentation (now impossible: parent never sets KEEP_TAB).
     const dir = createTestDir();
     try {
       const sessionFile = join(dir, "s.jsonl");
@@ -2766,23 +2790,40 @@ describe("subagent startup delay", () => {
     }
   });
 });
-describe("subagent keep-tab", () => {
+describe("subagent keep-tab (config.json sole truth, no KEEP_TAB wire)", () => {
   it("shouldKeepSurface is config-driven (tabs.keepOpen), never shell env", () => {
     const testApi = (subagentsModule as any).__test__;
     assert.ok(testApi, "expected subagents test helpers to be exported");
     assert.equal(typeof testApi.shouldKeepSurface, "function");
 
-    // Shell env must not flip the decision either way, whatever the local
-    // config says — config is the only source.
+    // Legacy shell env must not flip the decision either way, whatever the
+    // local config says — config is the only source. The var is scrubbed.
     const before = testApi.shouldKeepSurface();
-    const original = process.env.PI_SUBAGENT_KEEP_TAB;
+    const env = process.env as Record<string, string | undefined>;
+    const original = env.PI_SUBAGENT_KEEP_TAB;
     try {
-      process.env.PI_SUBAGENT_KEEP_TAB = before ? "0" : "1";
+      env.PI_SUBAGENT_KEEP_TAB = before ? "0" : "1";
       assert.equal(testApi.shouldKeepSurface(), before);
     } finally {
-      if (original == null) delete process.env.PI_SUBAGENT_KEEP_TAB;
-      else process.env.PI_SUBAGENT_KEEP_TAB = original;
+      if (original == null) delete env.PI_SUBAGENT_KEEP_TAB;
+      else env.PI_SUBAGENT_KEEP_TAB = original;
     }
+  });
+
+  it("per-agent precedence: keep ⇔ (keepOpen && !autoExit)", () => {
+    const testApi = (subagentsModule as any).__test__;
+    assert.equal(typeof testApi.shouldKeepSurfaceFor, "function");
+    assert.equal(typeof testApi.shouldKeepForAgent, "function");
+    // Truth table from docs/EXIT-KEEP-PRECEDENCE.md, expressed against the
+    // live config: keep is only possible when config allows it.
+    const keepOpen = testApi.shouldKeepSurface();
+    // autoExit=true ⇒ never keep (exit), regardless of keepOpen.
+    assert.equal(testApi.shouldKeepSurfaceFor(true), false);
+    assert.equal(testApi.shouldKeepForAgent({ autoExit: true }), false);
+    // autoExit=false ⇒ keep iff keepOpen.
+    assert.equal(testApi.shouldKeepSurfaceFor(false), keepOpen);
+    assert.equal(testApi.shouldKeepForAgent({ autoExit: false }), keepOpen);
+    assert.equal(testApi.shouldKeepForAgent(null), keepOpen);
   });
 });
 describe("subagents widget rendering", () => {

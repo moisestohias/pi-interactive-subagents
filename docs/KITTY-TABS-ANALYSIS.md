@@ -335,15 +335,28 @@ query/response traffic plus mutual byte-stealing stalls input handling (symptom 
 instead of corrupting the session. One-time user setup: `allow_remote_control yes` + `listen_on` in kitty.conf,
 restart kitty.
 
-## 11. Keep-open mode (`tabs.keepOpen`): pi stays interactive
+## 11. Keep-open mode (`tabs.keepOpen` × `auto-exit`): pi stays interactive
 
-Keep-tab first only left the shell open (pi had already exited). Full behavior now: with `tabs.keepOpen: true`
-in config.json, the parent suppresses `PI_SUBAGENT_AUTO_EXIT` and passes the internal `PI_SUBAGENT_KEEP_TAB=1`
-wire in the child env, so pi stays interactive after its task; the child reports its first clean finish once via
-a `.done` sidecar (errors reuse `.exit`), which the parent's poller consumes like an exit — same notification,
-same widget drop, tab left open. Config is the only decision source (shell env is never consulted; applies on
-`/reload`); the env var survives purely as the parent→child launch wire. Signals after the first belong to
-whoever drives the tab (in-memory `completionSignaled` flag, one shot). Safety: resume refuses while the kept
-tab is alive (two pi processes must never share one `.jsonl`) — the kept window id is persisted in the
-name-registry entry (`surface?`), so the guard survives restarts; stale sidecars are cleared at resume start;
-aborts (shutdown/reload) always close tabs.
+Keep-tab first only left the shell open (pi had already exited). Full behavior now — see
+`docs/EXIT-KEEP-PRECEDENCE.md` for the contract:
+
+- `tabs.keepOpen: false` (config.json, global) forces EXIT for every agent, even
+  `auto-exit: false` ones (global takes precedence; parent sets
+  `PI_SUBAGENT_AUTO_EXIT=1` regardless).
+- `tabs.keepOpen: true` delegates to the agent: `auto-exit: true` ⇒ EXIT
+  (session + tab close), `auto-exit: false` ⇒ KEEP (pi stays interactive after
+  its task; the child reports its first clean finish once via a `.done` sidecar,
+  errors reuse `.exit`).
+- The legacy `PI_SUBAGENT_KEEP_TAB` wire is removed — never set, never read,
+  scrubbed via `unset PI_SUBAGENT_KEEP_TAB;` in launch/resume commands and deleted
+  in both parent and child if inherited. `tabs.keepOpen` in config.json is the sole
+  decision source (shell env never consulted; applies on `/reload`); the per-agent
+  side travels only as `PI_SUBAGENT_AUTO_EXIT`.
+
+The parent's poller consumes `.done` like an exit — same notification, same widget
+drop, tab left open. Signals after the first belong to whoever drives the tab
+(in-memory `completionSignaled` flag, one shot). Safety: resume (always autonomous,
+so always exits) refuses while the kept tab is alive (two pi processes must never
+share one `.jsonl`) — the kept window id is persisted in the name-registry entry
+(`surface?`), so the guard survives restarts; stale sidecars are cleared at resume
+start; aborts (shutdown/reload) always close tabs.

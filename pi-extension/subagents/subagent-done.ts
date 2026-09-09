@@ -3,11 +3,21 @@
  * - Shows agent identity + available tools as a styled widget above the editor (toggle with Ctrl+Alt+O)
  * - Provides an `ask_question` tool for asking the parent orchestrator a question
  *
+ * Exit/keep precedence (sole truth: config.json `tabs.keepOpen` × agent.md `auto-exit`):
+ *   keepOpen=false + auto-exit=*     → EXIT (session + tab close; global takes precedence)
+ *   keepOpen=true  + auto-exit=true  → EXIT (session + tab close)
+ *   keepOpen=true  + auto-exit=false → KEEP (session stays interactive, `.done` once, tab left open)
+ *
+ * The parent encodes this into `PI_SUBAGENT_AUTO_EXIT` (effective exit flag).
+ * This child only reads that flag — the legacy `PI_SUBAGENT_KEEP_TAB` wire is
+ * removed: it is scrubbed from the launch command, deleted here if inherited
+ * from an old shell, and never consulted. Only config.json (via the parent)
+ * decides keep-open.
+ *
  * Subagents do NOT self-terminate via a tool. Auto-exit agents shut down
  * automatically when their agent loop ends (see the `agent_end` handler);
- * interactive agents end when the human exits the pane. In keep-open mode
- * (`PI_SUBAGENT_KEEP_TAB=1`, auto-exit suppressed by the parent) the session
- * stays interactive after finishing and signals completion once via `.done`.
+ * kept-open sessions stay interactive after finishing and signal completion
+ * once via `.done`.
  *
  * `ask_question` keeps the session OPEN: it writes a `${sessionFile}.ask`
  * signal the parent's watcher picks up, parks the session in a "waiting" state
@@ -117,20 +127,23 @@ export default function (pi: ExtensionAPI) {
   let denied: string[] = [];
   let expanded = false;
 
+  // Legacy wire cleanup: PI_SUBAGENT_KEEP_TAB is removed. If an old shell,
+  // dotfile, or parent still exports it, drop it — only config.json (encoded
+  // by the parent into PI_SUBAGENT_AUTO_EXIT) is truth.
+  if ("PI_SUBAGENT_KEEP_TAB" in process.env) {
+    delete process.env.PI_SUBAGENT_KEEP_TAB;
+  }
   // Read subagent identity from env vars (set by parent orchestrator)
   const subagentName = process.env.PI_SUBAGENT_NAME ?? "";
   const subagentAgent = process.env.PI_SUBAGENT_AGENT ?? "";
   const deniedToolsValue = process.env.PI_DENY_TOOLS;
+  // Effective exit flag from the parent: true ⇔ should close (session + tab).
+  // Parent computes: exit ⇔ (!tabs.keepOpen || agent auto-exit).
+  // False ⇔ keep-open run (tabs.keepOpen=true + auto-exit=false): stay
+  // interactive after finishing and report the first clean finish once via
+  // a `.done` sidecar so the parent is still notified. Errors use the same
+  // `.exit` sidecar as the auto-exit path.
   const autoExit = process.env.PI_SUBAGENT_AUTO_EXIT === "1";
-  // Keep-open mode (parent sets this from config `tabs.keepOpen` when the run
-  // is launched with tabs kept open): the session stays interactive after
-  // finishing instead of shutting down, and reports its first clean finish
-  // once via a `.done` sidecar so the parent is still notified. Errors use
-  // the same `.exit` sidecar as the auto-exit path. Internal wire — users set
-  // `tabs.keepOpen` in config.json, never this variable directly.
-  const keepOpen = ["1", "true", "yes"].includes(
-    (process.env.PI_SUBAGENT_KEEP_TAB ?? "").trim().toLowerCase(),
-  );
   let completionSignaled = false;
   const recorder = createSubagentActivityRecorder({
     runningChildId: process.env.PI_SUBAGENT_ID,
@@ -280,9 +293,10 @@ export default function (pi: ExtensionAPI) {
       return;
     }
 
-    if (!autoExit && keepOpen && finishedTurn && !completionSignaled) {
-      // Staying open by request: tell the parent this turn finished (once —
-      // later manual turns belong to whoever is driving this tab now).
+    // Keep-open run (!autoExit ⇔ keepOpen=true + auto-exit=false): stay open and
+    // tell the parent this turn finished (once — later manual turns belong to
+    // whoever drives the tab now).
+    if (!autoExit && finishedTurn && !completionSignaled) {
       completionSignaled = true;
       const sessionFile = process.env.PI_SUBAGENT_SESSION;
       const errorInfo = findLatestAssistantError(messages);

@@ -139,6 +139,12 @@ You are a specialized agent that does X...
 
 With `auto-exit: true`, the session shuts down when the agent's turn ends — the agent just writes its final message and stops (there is no "done" tool). The last assistant message becomes the summary returned to the parent. Recommended for all autonomous agents.
 
+Exit vs keep-open precedence (`tabs.keepOpen` × `auto-exit` — see `docs/EXIT-KEEP-PRECEDENCE.md`):
+
+- `tabs.keepOpen: false` (global) forces **exit** for every agent, even `auto-exit: false` ones.
+- `tabs.keepOpen: true` delegates to the agent: `auto-exit: true` ⇒ **exit** (session + tab close), `auto-exit: false` ⇒ **keep** (session stays interactive, tab left open, completion reported once via `.done`).
+- The legacy `PI_SUBAGENT_KEEP_TAB` env var is removed — `tabs.keepOpen` in `config.json` is the sole truth.
+
 Notes:
 
 - **Manual input does not strand an auto-exit sub-agent.** If a human types into the tab, the session still closes once that turn completes normally — only an escape/abort leaves it open.
@@ -190,7 +196,7 @@ gitignored). Applies on `/reload`, no pi restart needed:
 | Key | Default | Description |
 | --- | ------- | ----------- |
 | `status.enabled` | `true` | Live per-subagent status in the widget (active tool, waits, stall/recovery pings) |
-| `tabs.keepOpen` | `false` | Leave finished sub-agent tabs open with pi still interactive (see above) |
+| `tabs.keepOpen` | `false` | Global keep switch: `false` always closes session + tab; `true` delegates to the agent's `auto-exit` (`true` closes, `false` leaves tab open with pi interactive — see `docs/EXIT-KEEP-PRECEDENCE.md`) |
 
 ## Requirements
 
