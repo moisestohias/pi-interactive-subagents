@@ -1296,6 +1296,48 @@ describe("subagent discovery", () => {
     }
   });
 
+  it("subagent_agents gate: missing/false blocks, true opens, list restricts", () => {
+    const testApi = (subagentsModule as any).__test__;
+    assert.equal(typeof testApi.parseSubagentAgents, "function");
+    assert.equal(typeof testApi.canSpawnSubagents, "function");
+    // Parsing.
+    assert.equal(testApi.parseSubagentAgents(undefined), undefined);
+    assert.equal(testApi.parseSubagentAgents("true"), true);
+    assert.equal(testApi.parseSubagentAgents(" True "), true);
+    assert.equal(testApi.parseSubagentAgents("false"), false);
+    assert.equal(testApi.parseSubagentAgents("FALSE"), false);
+    assert.deepEqual(testApi.parseSubagentAgents("scout, researcher"), ["scout", "researcher"]);
+    assert.equal(testApi.parseSubagentAgents(""), undefined);
+    assert.equal(testApi.parseSubagentAgents("   "), undefined);
+    // Grant decision: missing or false → no spawning; true or list → spawning.
+    assert.equal(testApi.canSpawnSubagents(null), false);
+    assert.equal(testApi.canSpawnSubagents({}), false);
+    assert.equal(testApi.canSpawnSubagents({ subagentAgents: undefined }), false);
+    assert.equal(testApi.canSpawnSubagents({ subagentAgents: false }), false);
+    assert.equal(testApi.canSpawnSubagents({ subagentAgents: true }), true);
+    assert.equal(testApi.canSpawnSubagents({ subagentAgents: ["scout"] }), true);
+    assert.equal(testApi.canSpawnSubagents({ subagentAgents: [] }), false);
+  });
+
+  it("subagent_agents frontmatter round-trips through agent files", async () => {
+    const testApi = (subagentsModule as any).__test__;
+    await withIsolatedAgentEnv(async ({ projectAgentsDir }) => {
+      writeAgentFile(projectAgentsDir, "open-spawner", ["name: open-spawner", "subagent_agents: true"].join("\n"));
+      writeAgentFile(projectAgentsDir, "closed-spawner", ["name: closed-spawner", "subagent_agents: false"].join("\n"));
+      writeAgentFile(
+        projectAgentsDir,
+        "listed-spawner",
+        ["name: listed-spawner", "subagent_agents: scout, researcher"].join("\n"),
+      );
+      assert.equal(testApi.loadAgentDefaults("open-spawner")?.subagentAgents, true);
+      assert.equal(testApi.loadAgentDefaults("closed-spawner")?.subagentAgents, false);
+      assert.deepEqual(testApi.loadAgentDefaults("listed-spawner")?.subagentAgents, ["scout", "researcher"]);
+      assert.equal(testApi.canSpawnSubagents(testApi.loadAgentDefaults("open-spawner")), true);
+      assert.equal(testApi.canSpawnSubagents(testApi.loadAgentDefaults("closed-spawner")), false);
+      assert.equal(testApi.canSpawnSubagents(testApi.loadAgentDefaults("listed-spawner")), true);
+    });
+  });
+
   it("getToolExtensionPath maps custom tools and skips built-ins", () => {
     assert.equal(testApi.getToolExtensionPath("read"), undefined);
     assert.equal(testApi.getToolExtensionPath("bash"), undefined);

@@ -153,12 +153,15 @@ interface AgentDefaults {
   skills?: string;
   thinking?: string;
   /**
-   * If set (non-empty), this agent is granted the full subagent spawning
-   * toolset and may only spawn the listed agents. Presence of this field —
-   * not the `tools` list — is what grants spawning. Enforced in the child via
-   * the PI_SUBAGENT_ALLOWED env var.
+   * Controls whether this agent may spawn its own subagents. Missing or
+   * `false` (the default) means it cannot spawn at all. `true` grants the
+   * full subagent spawning toolset with no target restriction (may spawn any
+   * discoverable agent). A non-empty list grants the toolset restricted to
+   * exactly the listed agents. This field — not the `tools` list — is what
+   * grants spawning. Lists are enforced in the child via the
+   * PI_SUBAGENT_ALLOWED env var (`true` leaves it unset = unrestricted).
    */
-  subagentAgents?: string[];
+  subagentAgents?: boolean | string[];
   autoExit?: boolean;
   interactive?: boolean;
   systemPromptMode?: "append" | "replace";
@@ -184,7 +187,8 @@ interface ListedAgentDefinition extends AgentDefinition {
 /**
  * The full subagent lifecycle/spawning toolset registered by this extension.
  * An agent is granted these (and this extension is loaded into its child
- * process) only when its frontmatter declares a non-empty `subagent_agents`.
+ * process) only when its frontmatter sets `subagent_agents: true` or a
+ * non-empty `subagent_agents` list. Missing or `false` grants nothing.
  */
 const SPAWNING_TOOLS = [
   "subagent",
@@ -295,6 +299,28 @@ function parseCommaList(value: string | undefined): string[] | undefined {
   return list.length > 0 ? list : undefined;
 }
 
+/**
+ * Parse the `subagent_agents` frontmatter gate:
+ * missing → undefined (no spawning), `true` → true (spawn any),
+ * `false` → false (no spawning), otherwise a comma-separated allowlist.
+ * Matching is case-insensitive for the booleans; anything else is a list
+ * (so `True`/`FALSE` with surrounding whitespace still work, while
+ * `scout, researcher` stays a list).
+ */
+function parseSubagentAgents(value: string | undefined): boolean | string[] | undefined {
+  if (value == null) return undefined;
+  const trimmed = value.trim();
+  if (/^true$/i.test(trimmed)) return true;
+  if (/^false$/i.test(trimmed)) return false;
+  return parseCommaList(value);
+}
+
+/** Whether this agent definition may spawn subagents at all. */
+function canSpawnSubagents(agentDefs: AgentDefaults | null | undefined): boolean {
+  const gate = agentDefs?.subagentAgents;
+  return gate === true || (Array.isArray(gate) && gate.length > 0);
+}
+
 function parseSessionMode(value: string | undefined): SubagentSessionMode | undefined {
   if (value === "standalone" || value === "lineage-only" || value === "fork") {
     return value;
@@ -323,7 +349,7 @@ function parseAgentDefinition(content: string, fallbackName: string): AgentDefin
           : undefined,
     skills: getFrontmatterValue(frontmatter, "skill") ?? getFrontmatterValue(frontmatter, "skills"),
     thinking: getFrontmatterValue(frontmatter, "thinking"),
-    subagentAgents: parseCommaList(getFrontmatterValue(frontmatter, "subagent_agents")),
+    subagentAgents: parseSubagentAgents(getFrontmatterValue(frontmatter, "subagent_agents")),
     autoExit: parseOptionalBoolean(getFrontmatterValue(frontmatter, "auto-exit")),
     interactive: parseOptionalBoolean(getFrontmatterValue(frontmatter, "interactive")),
     sessionMode: parseSessionMode(getFrontmatterValue(frontmatter, "session-mode")),
@@ -1358,6 +1384,8 @@ export const __test__ = {
   resolveEffectiveSessionMode,
   resolveLaunchBehavior,
   resolveEffectiveInteractive,
+  parseSubagentAgents,
+  canSpawnSubagents,
   buildSubagentToolAllowlist,
   applySandboxToParts,
   buildPiPromptArgs,
@@ -1468,9 +1496,11 @@ async function launchSubagent(
   const summaryInstruction = agentDefs?.autoExit
     ? "Your FINAL assistant message should summarize what you accomplished."
     : "Your FINAL assistant message (before the user exits) should summarize what you accomplished.";
-  // An agent with a non-empty subagent_agents list is granted the spawning
-  // toolset and may only spawn the listed agents (enforced via PI_SUBAGENT_ALLOWED).
-  const grantSpawning = !!(agentDefs?.subagentAgents && agentDefs.subagentAgents.length > 0);
+  // The subagent_agents gate grants the spawning toolset: `true` means any
+  // discoverable agent (PI_SUBAGENT_ALLOWED left unset = unrestricted), a list
+  // pins the child to exactly those agents (enforced via PI_SUBAGENT_ALLOWED).
+  // Missing or `false` grants nothing.
+  const grantSpawning = canSpawnSubagents(agentDefs);
   const identity = agentDefs?.body ?? null;
   const systemPromptMode = agentDefs?.systemPromptMode;
   const identityInSystemPrompt = systemPromptMode && identity;
@@ -1588,7 +1618,10 @@ async function launchSubagent(
     thinking: effectiveThinking ?? null,
     systemPromptMode: systemPromptMode ?? null,
     identity: identityInSystemPrompt ? identity : null,
-    spawnable: agentDefs?.subagentAgents ?? null,
+    // Lists round-trip for resume; `true` (unrestricted) and missing/`false`
+    // (no spawning) both persist as null — the tool allowlist above already
+    // records whether spawning was granted, so resume stays exact.
+    spawnable: Array.isArray(agentDefs?.subagentAgents) ? agentDefs.subagentAgents : null,
     autoExit: agentDefs?.autoExit ?? false,
     cwd: effectiveCwd ?? null,
     agentDir: resolvedAgentDir,
@@ -1606,7 +1639,9 @@ async function launchSubagent(
     envParts.push(`PI_CODING_AGENT_DIR=${shellEscape(resolvedAgentDir)}`);
   }
 
-  if (grantSpawning && agentDefs?.subagentAgents) {
+  // `true` leaves PI_SUBAGENT_ALLOWED unset (child allowlist = unrestricted);
+  // a list pins it. Missing/`false` never reach here (no grant).
+  if (grantSpawning && Array.isArray(agentDefs?.subagentAgents)) {
     envParts.push(`PI_SUBAGENT_ALLOWED=${shellEscape(agentDefs.subagentAgents.join(","))}`);
   }
   envParts.push(`PI_SUBAGENT_NAME=${shellEscape(params.name)}`);
@@ -2104,7 +2139,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
         // Strict whitelist at every depth. The caller's permitted set is:
         //   • a restricted subagent (PI_SUBAGENT_ALLOWED) → only its pinned agents;
-        //   • a top-level session → every discoverable agent, i.e. exactly what
+        //   • an unrestricted subagent (`subagent_agents: true`, no allowlist env)
+        //     or a top-level session → every discoverable agent, i.e. exactly what
         //     `subagents_list` shows.
         // Every spawn must name an agent in that set. The lone exception is a
         // top-level `fork: true` clone, which has no role and inherits the
