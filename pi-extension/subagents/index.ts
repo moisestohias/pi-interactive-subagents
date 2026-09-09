@@ -1033,7 +1033,9 @@ async function launchSubagent(
   const artifactDir = getArtifactDir(ctx.sessionManager.getSessionDir(), sessionId);
 
   const { effectiveCwd, localAgentDir, effectiveAgentDir } = resolveSubagentPaths(params, agentDefs);
-  const targetCwdForSession = effectiveCwd ?? ctx.cwd;
+  // Default to the parent session's working dir so the child shell starts
+  // where the parent runs (explicit `cwd` param / agent `cwd:` still wins).
+  const targetCwdForSession = effectiveCwd ?? ctx.cwd ?? process.cwd();
   const sessionDir = getDefaultSessionDirFor(targetCwdForSession, effectiveAgentDir);
 
   // Generate a deterministic session file path for this subagent.
@@ -1121,7 +1123,7 @@ async function launchSubagent(
       task: params.task,
       model: effectiveModel ?? null,
       systemPrompt: agentDefs.body ?? null,
-      cwd: effectiveCwd,
+      cwd: targetCwdForSession ?? null,
     });
     const command = withDoneSentinelCanonical(claudeBase);
 
@@ -1130,6 +1132,7 @@ async function launchSubagent(
 
     sendLongCommand(surface, command, {
       scriptPath: launchScriptFile,
+      cwd: targetCwdForSession ?? null,
       scriptPreamble: [
         `# Claude Code subagent launch script for ${params.name}`,
         `# Generated: ${new Date().toISOString()}`,
@@ -1201,7 +1204,7 @@ async function launchSubagent(
     // records whether spawning was granted, so resume stays exact.
     spawnable: Array.isArray(agentDefs?.subagentAgents) ? agentDefs.subagentAgents : null,
     autoExit: agentDefs?.autoExit ?? false,
-    cwd: effectiveCwd ?? null,
+    cwd: targetCwdForSession ?? null,
     agentDir: resolvedAgentDir,
   };
   writeSubagentLoadout(subagentSessionFile, loadout);
@@ -1264,9 +1267,9 @@ async function launchSubagent(
     parts.push(shellEscape(promptArg));
   }
 
-  // Resolve cwd — param overrides agent default, supports absolute and relative paths.
-  // This was already computed above so session placement, PI_CODING_AGENT_DIR, and cd agree.
-  const cdPrefix = buildCdPrefixCanonical(effectiveCwd);
+  // cd into the subagent cwd (parent session dir by default) before starting pi,
+  // so the child process cwd matches its session placement.
+  const cdPrefix = buildCdPrefixCanonical(targetCwdForSession);
 
   // Scrub the removed legacy wire: a user shell that still exports
   // PI_SUBAGENT_KEEP_TAB (dotfiles / old sessions) would otherwise leak it
@@ -1278,6 +1281,7 @@ async function launchSubagent(
   const launchScriptFile = scriptPathForCanonical(artifactDir, launchScriptName);
   sendLongCommand(surface, command, {
     scriptPath: launchScriptFile,
+    cwd: targetCwdForSession ?? null,
     scriptPreamble: scriptPreambleForCanonical("launch", {
       name: params.name,
       sessionFile: subagentSessionFile,
@@ -2295,8 +2299,10 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         const resumeEnvPrefix = resumeEnvParts.join(" ") + " ";
 
         // Resume in the subagent's original cwd so its tools (safe_bash, edits)
-        // operate where they did before.
-        const resumeCdPrefix = buildCdPrefixCanonical(loadout.cwd);
+        // operate where they did before (pre-cwd-default snapshots with null
+        // fall back to the current parent session dir).
+        const resumeCwd = loadout.cwd ?? (ctx as unknown as { cwd?: string }).cwd ?? null;
+        const resumeCdPrefix = buildCdPrefixCanonical(resumeCwd);
 
         const command = withDoneSentinelCanonical(`unset PI_SUBAGENT_KEEP_TAB; ${resumeCdPrefix}${resumeEnvPrefix}${parts.join(" ")}`);
         const launchScriptFile = scriptPathForCanonical(
@@ -2305,6 +2311,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         );
           sendLongCommand(surface, command, {
             scriptPath: launchScriptFile,
+            cwd: resumeCwd,
             scriptPreamble: scriptPreambleForCanonical("resume", {
               name,
               sessionFile: sessionPath,

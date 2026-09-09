@@ -262,7 +262,7 @@ export function sendCommand(surface: string, command: string): void {
 export function sendLongCommand(
   surface: string,
   command: string,
-  options?: { scriptPath?: string; scriptPreamble?: string },
+  options?: { scriptPath?: string; scriptPreamble?: string; cwd?: string | null },
 ): string {
   const scriptPath =
     options?.scriptPath ??
@@ -282,7 +282,12 @@ export function sendLongCommand(
   writeFileSync(scriptPath, scriptParts.join("\n") + "\n", {
     mode: 0o755,
   });
-  sendCommand(surface, `bash ${shellEscape(scriptPath)}`);
+  // Start the script from the subagent cwd so the `bash` process itself (and
+  // hence pi) inherits the parent session dir even before the script's inner
+  // `cd ... &&` runs (fresh kitty tabs start in `~`).
+  const invoke = `bash ${shellEscape(scriptPath)}`;
+  const outer = options?.cwd ? `cd ${shellEscape(options.cwd)} && ${invoke}` : invoke;
+  sendCommand(surface, outer);
   return scriptPath;
 }
 
