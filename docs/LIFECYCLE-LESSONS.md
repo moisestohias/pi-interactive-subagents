@@ -84,13 +84,15 @@ to the wrong tab.
 **What we do:** `keptKey(artifactDir, name)` everywhere; lookups always carry
 the caller's artifact dir.
 
-## 7. Make the invisible round-trip traceable to a file
+## 7. Make the invisible round-trip traceable while diagnosing
 
-**Rule:** watcher start/exit, `.ask` seen/sent, steer attempts, and recovery
-hits all append one line to `/tmp/pi-subagents-debug.log`.
+**Rule:** when supervision fails silently, add temporary file tracing (watcher
+start/exit, `.ask` seen/sent, steer attempts, recovery hits), then remove it
+once the regression tests pin the fix.
 
 **Why:** supervision failures are silent by construction — no turn fires, no
-error surfaces, both sides just wait. The debug log turned "still not working"
-into a timestamped causal chain in one exchange (`watch:exit-seen done` eight
-seconds before the question existed). Gate with `PI_SUBAGENT_DEBUG=0` if the
-~1 line/sec per watched tab ever matters.
+error surfaces, both sides just wait. A temporary log turned "still not
+working" into a timestamped causal chain in one exchange (`watch:exit-seen
+done` eight seconds before the question existed). File tracing is a diagnostic
+scaffold, not a feature: it costs ~1 line/sec per watched tab, so it comes out
+when the tests go in.

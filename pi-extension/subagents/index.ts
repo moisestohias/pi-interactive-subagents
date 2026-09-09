@@ -8,41 +8,11 @@ import {
   readdirSync,
   readFileSync,
   writeFileSync,
-  appendFileSync,
   existsSync,
   mkdirSync,
   copyFileSync,
   unlinkSync,
 } from "node:fs";
-
-/**
- * File trace for the ask_question / subagent_message round-trip.
- * Live delivery failures leave no UI trace (the watcher just never fires),
- * so every step appends one line to /tmp/pi-subagents-debug.log:
- * watcher start/tick/end, .ask seen, sendMessage outcome, steer outcome.
- * Volume is ~1 line/sec per running subagent while a watch is active.
- * Disable with PI_SUBAGENTS_DEBUG=0.
- */
-function debugLog(...args: unknown[]): void {
-  try {
-    if (process.env.PI_SUBAGENTS_DEBUG === "0") return;
-    const line =
-      `[${new Date().toISOString()} pid=${process.pid}] ` +
-      args
-        .map((a) => {
-          if (typeof a === "string") return a;
-          try {
-            return JSON.stringify(a);
-          } catch {
-            return String(a);
-          }
-        })
-        .join(" ");
-    appendFileSync("/tmp/pi-subagents-debug.log", line + "\n");
-  } catch {
-    // Logging must never break the extension.
-  }
-}
 import { homedir } from "node:os";
 import {
   isMuxAvailable,
@@ -807,7 +777,6 @@ function findKeptTab(
  * clean close afterwards is silent. Aborted on session shutdown / tab death.
  */
 async function monitorKeptTab(kept: KeptTab, piInstance: ExtensionAPI): Promise<void> {
-  debugLog("kept:monitor-start", kept.name, `surface=${kept.surface}`);
   try {
     const result = await pollForExit(
       kept.surface,
@@ -816,19 +785,14 @@ async function monitorKeptTab(kept: KeptTab, piInstance: ExtensionAPI): Promise<
         interval: 2000,
         sessionFile: kept.sessionFile,
         onTick() {
-          try {
-            deliverPendingQuestion(
-              { name: kept.name, agent: kept.agent, sessionFile: kept.sessionFile, startTime: Date.now() },
-              piInstance,
-            );
-          } catch (err: any) {
-            debugLog("kept:deliver-threw", kept.name, err?.message ?? String(err));
-          }
+          deliverPendingQuestion(
+            { name: kept.name, agent: kept.agent, sessionFile: kept.sessionFile, startTime: Date.now() },
+            piInstance,
+          );
         },
       },
     );
     if (result.reason === "error") {
-      debugLog("kept:error", kept.name, result.errorMessage ?? "");
       try {
         piInstance.sendMessage(
           {
@@ -841,14 +805,13 @@ async function monitorKeptTab(kept: KeptTab, piInstance: ExtensionAPI): Promise<
           },
           { triggerTurn: true, deliverAs: "steer" },
         );
-      } catch (err: any) {
-        debugLog("kept:error-send-threw", kept.name, err?.message ?? String(err));
+      } catch {
+        // Best effort — the error is also visible in the kept tab itself.
       }
-    } else {
-      debugLog("kept:tab-closed", kept.name);
     }
-  } catch (err: any) {
-    debugLog("kept:monitor-end", kept.name, err?.message ?? String(err));
+    // Clean close afterwards is silent: the first result was already delivered.
+  } catch {
+    // Aborts (shutdown/reload) and poll failures end the monitor quietly.
   } finally {
     keptTabs.delete(keptKey(kept.parentArtifactDir, kept.name));
     try {
@@ -1300,16 +1263,13 @@ function handleSubagentSteer(
   const now = Date.now();
   observeRunningSubagent(running, now);
 
-  debugLog("steer:attempt", running.name, `surface=${running.surface}`, `len=${message.length}`);
   const steer = steerSubagent(running, message, send);
   if ("error" in steer) {
-    debugLog("steer:failed", running.name, steer.error);
     return {
       content: [{ type: "text" as const, text: steer.error }],
       details: { error: steer.error, id: running.id, name: running.name },
     };
   }
-  debugLog("steer:sent", running.name, `surface=${running.surface}`);
 
   running.statusState = forceStatusAfterInterrupt(running.statusState, now);
   updateWidget();
@@ -1818,7 +1778,6 @@ function recoverPendingQuestions(piInstance: ExtensionAPI, artifactDir: string):
       continue;
     }
     if (!askExists) continue;
-    debugLog("recover:found", name, sessionFile);
     let agent: string | undefined;
     try {
       agent = readSubagentLoadout(sessionFile)?.agent ?? undefined;
@@ -1836,20 +1795,17 @@ function deliverPendingQuestion(running: QuestionCarrier, piInstance?: Extension
     askExists = existsSync(askFile);
   } catch {}
   if (!askExists) return false;
-  debugLog("ask:tick-seen", running.name, askFile);
   let payload: any = null;
   try {
     payload = JSON.parse(readFileSync(askFile, "utf-8"));
-  } catch (err: any) {
+  } catch {
     // Malformed/partway-written file — drop it and move on.
-    debugLog("ask:unparseable", running.name, err?.message ?? String(err));
     try {
       unlinkSync(askFile);
     } catch {}
     return false;
   }
   if (!payload?.question) {
-    debugLog("ask:no-question-field", running.name);
     try {
       unlinkSync(askFile);
     } catch {}
@@ -1868,7 +1824,6 @@ function deliverPendingQuestion(running: QuestionCarrier, piInstance?: Extension
   const replyHint = `\n\nReply with subagent_message({ name: "${name}", message: "…" }) — the same name works whether it is still running or has since exited. It stays open until you reply.`;
 
   try {
-    debugLog("ask:sending", name, `hasExplicitPi=${!!piInstance}`, `hasLatestPi=${!!latestPi}`);
     target.sendMessage(
       {
         customType: "subagent_question",
@@ -1883,9 +1838,7 @@ function deliverPendingQuestion(running: QuestionCarrier, piInstance?: Extension
       },
       { triggerTurn: true, deliverAs: "steer" },
     );
-    debugLog("ask:sent", name);
-  } catch (err: any) {
-    debugLog("ask:send-threw", name, err?.message ?? String(err));
+  } catch {
     return false; // keep the file — retry on the next tick
   }
   try {
@@ -1900,7 +1853,6 @@ async function watchSubagent(
   piInstance?: ExtensionAPI | null,
 ): Promise<SubagentResult> {
   const { name, task, surface, startTime, sessionFile } = running;
-  debugLog("watch:start", name, sessionFile, `surface=${surface}`, `hasPi=${!!piInstance}`);
 
   try {
     const result = await pollForExit(surface, AbortSignal.any([signal, getModuleAbortSignal()]), {
@@ -1908,19 +1860,10 @@ async function watchSubagent(
       sessionFile,
       sentinelFile: running.sentinelFile,
       onTick() {
-        try {
-          observeRunningSubagent(running);
-        } catch (err: any) {
-          debugLog("watch:observe-threw", name, err?.message ?? String(err));
-        }
-        try {
-          deliverPendingQuestion(running, piInstance);
-        } catch (err: any) {
-          debugLog("watch:deliver-threw", name, err?.message ?? String(err));
-        }
+        observeRunningSubagent(running);
+        deliverPendingQuestion(running, piInstance);
       },
     });
-    debugLog("watch:exit-seen", name, result.reason, `code=${result.exitCode}`);
 
     const elapsed = Math.floor((Date.now() - startTime) / 1000);
 
@@ -1998,7 +1941,6 @@ async function watchSubagent(
       ...(stats ? { stats } : {}),
     };
   } catch (err: any) {
-    debugLog("watch:ended-with-error", name, err?.message ?? String(err));
     try {
       // Aborts mean this session is going away (shutdown/reload) — always
       // clean up. Genuine errors honor this run's keep decision for inspection.
@@ -2071,7 +2013,6 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             } catch {
               agent = undefined;
             }
-            debugLog("kept:reattach", regName, `surface=${surf}`);
             trackKeptTab(
               artifactDir,
               { name: regName, agent, surface: surf, sessionFile: sf, sessionId: (regEntry as { sessionId?: string }).sessionId ?? null },
@@ -2604,15 +2545,11 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         if (entry.surface) {
           const kept = findKeptTab(parentArtifactDir, requestedName);
           if (kept) {
-            debugLog("steer:kept-attempt", requestedName, `surface=${kept.surface}`);
             const steer = steerSubagent(
               { surface: kept.surface, name: kept.name } as RunningSubagent,
               params.message,
             );
-            if ("error" in steer) {
-              debugLog("steer:kept-failed", requestedName, steer.error);
-            } else {
-              debugLog("steer:kept-sent", requestedName, `surface=${kept.surface}`);
+            if (!("error" in steer)) {
               return {
                 content: [{
                   type: "text" as const,

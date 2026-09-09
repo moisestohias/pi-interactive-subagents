@@ -6,8 +6,7 @@ reached the sub-agent.
 
 ## Evidence
 
-Live trace (`/tmp/pi-subagents-debug.log`, since removed or gated by
-`PI_SUBAGENTS_DEBUG=0`):
+Live trace (temporary file logging, since removed):
 
 ```
 12:29:14  watch:start worker ... surface=63 hasPi=true
@@ -75,5 +74,5 @@ never consumed by any live watcher).
   (`auto-exit: true`); with `keepOpen: true` that global override means workers
   keep tabs open. Pre-existing local config, unrelated to this fix — flagging
   because it changes which table row workers land on.
-- Debug trace file `/tmp/pi-subagents-debug.log` (~1 line/sec per watched tab);
-  disable with `PI_SUBAGENTS_DEBUG=0`.
+- Temporary file tracing used during diagnosis is removed; the regression
+  tests in `test/test.ts` (`ask_question delivery` suite) pin the fixed behavior.
