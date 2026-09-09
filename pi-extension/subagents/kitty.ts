@@ -1,10 +1,10 @@
 /**
  * kitty surface layer — subagents run in kitty tabs.
  *
- * Same export surface as the archived `tmux.ts.archived`, so `index.ts` and the
- * test harness only change their import path. Everything the extension does to
- * a terminal goes through the small API in this file: open a tab, type a
- * command into it, read its screen, close it, and poll for exit.
+ * Everything the extension does to a terminal goes through the small API in
+ * this file: open a tab, type a command into it, read its screen, close it,
+ * and poll for exit. `Surface` is the canonical name for the handle (a kitty
+ * window id); historical `mux` aliases are kept for compat.
  *
  * Tabs are identified by kitty window ids (e.g. `18`) — each subagent tab
  * holds a single window, so the window id is a stable handle for `--match`.
@@ -18,7 +18,7 @@
  */
 import { execFile, execFileSync } from "node:child_process";
 import { promisify } from "node:util";
-import { existsSync, readFileSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
+import { existsSync, readFileSync, renameSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 
@@ -29,20 +29,18 @@ const execFileAsync = promisify(execFile);
 const commandAvailability = new Map<string, boolean>();
 
 function hasCommand(command: string): boolean {
-  if (commandAvailability.has(command)) {
-    return commandAvailability.get(command)!;
-  }
-
-  let available = false;
+  const cached = commandAvailability.get(command);
+  if (cached === true) return true;
+  // N2: pass the name as a positional arg (no interpolation into `sh -c`),
+  // and only cache positive results so installing kitty later is picked up
+  // without restarting pi.
   try {
-    execFileSync("sh", ["-c", `command -v ${command}`], { stdio: "ignore" });
-    available = true;
+    execFileSync("sh", ["-c", "command -v -- \"$1\"", "sh", command], { stdio: "ignore" });
+    commandAvailability.set(command, true);
+    return true;
   } catch {
-    available = false;
+    return false;
   }
-
-  commandAvailability.set(command, available);
-  return available;
 }
 
 /**
@@ -65,16 +63,24 @@ export function isMuxAvailable(): boolean {
   return isKittyAvailable();
 }
 
-export function muxSetupHint(): string {
+/** @deprecated Use isKittyAvailable (kept for compat). */
+export const isSurfaceAvailable = isKittyAvailable;
+
+export function kittySetupHint(): string {
   return (
     "Subagents need kitty remote control over a socket (required — tty control corrupts the main session). " +
     "Add to kitty.conf: `allow_remote_control yes` and `listen_on unix:/tmp/kitty-$USER`, then restart kitty."
   );
 }
 
+/** @deprecated Use kittySetupHint (kept for compat). */
+export function muxSetupHint(): string {
+  return kittySetupHint();
+}
+
 function requireKitty(): void {
   if (!isKittyAvailable()) {
-    throw new Error(`kitty tabs are required for subagents. ${muxSetupHint()}`);
+    throw new Error(`kitty tabs are required for subagents. ${kittySetupHint()}`);
   }
 }
 
@@ -95,7 +101,7 @@ function kittenSync(args: string[], input?: string): string {
       ...(input !== undefined ? { input } : {}),
     });
   } catch (error: any) {
-    throw new Error(`${error?.message ?? String(error)} ${muxSetupHint()}`);
+    throw new Error(`${error?.message ?? String(error)} ${kittySetupHint()}`);
   }
 }
 
@@ -108,7 +114,7 @@ async function kittenAsync(args: string[], input?: string): Promise<string> {
     });
     return stdout;
   } catch (error: any) {
-    throw new Error(`${error?.message ?? String(error)} ${muxSetupHint()}`);
+    throw new Error(`${error?.message ?? String(error)} ${kittySetupHint()}`);
   }
 }
 
@@ -161,9 +167,8 @@ export function createSurface(name: string): string {
 }
 
 /**
- * Tabs-first: splits are not used. Kept for API compatibility (callers and
- * tests); direction/fromSurface are accepted and ignored — every subagent
- * gets its own full-width tab.
+ * @deprecated Splits are not used (tabs-first). Use createSurface.
+ * Kept for API compatibility; direction/fromSurface are ignored.
  */
 export function createSurfaceSplit(
   name: string,
@@ -181,12 +186,18 @@ export function createSurfaceSplit(
  * into an honest error: steering a closed tab reports failure instead of
  * pretending the message was delivered.
  */
-export function windowExists(surface: string): boolean {
+/**
+ * True when a window with this id still exists. Returns null when the
+ * control plane itself failed (dead socket, corrupt `ls` JSON) — callers
+ * must NOT treat that as "tab gone" (N3): pruning or reporting death on a
+ * socket hiccup loses live sessions.
+ */
+export function windowExistsOrNull(surface: string): boolean | null {
   if (!/^\d+$/.test(surface)) return false;
   try {
     const out = kittenSync(["ls"]);
     const osWindows = JSON.parse(out);
-    if (!Array.isArray(osWindows)) return false;
+    if (!Array.isArray(osWindows)) return null;
     for (const osWindow of osWindows) {
       const tabs = (osWindow as any)?.tabs;
       if (!Array.isArray(tabs)) continue;
@@ -200,8 +211,15 @@ export function windowExists(surface: string): boolean {
     }
     return false;
   } catch {
-    return false;
+    return null;
   }
+}
+
+export function windowExists(surface: string): boolean {
+  // Legacy boolean wrapper: control-plane failure reads as false.
+  // Prefer windowExistsOrNull in prune paths (kept-tab GC must not prune on
+  // a socket hiccup).
+  return windowExistsOrNull(surface) === true;
 }
 
 /**
@@ -214,8 +232,17 @@ export function windowExists(surface: string): boolean {
 export function sendCommand(surface: string, command: string): void {
   requireKitty();
   const match = matchFor(surface);
-  if (!windowExists(surface)) {
+  // N4: advisory pre-check only (TOCTOU — the tab can die between `ls` and
+  // send, and kitty send to a dead id succeeds silently). It turns the common
+  // closed-tab case into an honest error at the cost of one `ls` round-trip.
+  const alive = windowExistsOrNull(surface);
+  if (alive === false) {
     throw new Error(`No such subagent tab (window id ${surface}) — it may have been closed.`);
+  }
+  if (alive === null) {
+    throw new Error(
+      `Kitty control plane unreachable while sending to tab ${surface} (socket hiccup?) — retry; the tab may still be alive.`,
+    );
   }
   kittenSync(["send-text", "--match", match, "--stdin"], command);
   kittenSync(["send-key", "--match", match, "enter"]);
@@ -336,12 +363,28 @@ function interpretExitSidecar(data: any): PollResult {
  * Returns null when neither exists. Files are deleted on read so each signal fires once.
  */
 function takeCompletionSidecar(sessionFile: string): PollResult | null {
+  // N5: claim via rename BEFORE parse so a corrupt `.exit` can never poison
+  // the poll loop forever (previously a JSON.parse throw skipped rmSync and
+  // the same file was retried every tick).
   try {
     const exitFile = `${sessionFile}.exit`;
     if (existsSync(exitFile)) {
-      const data = JSON.parse(readFileSync(exitFile, "utf-8"));
-      rmSync(exitFile, { force: true });
-      return interpretExitSidecar(data);
+      const claim = `${exitFile}.consuming-${process.pid}-${Math.random().toString(16).slice(2, 8)}`;
+      try {
+        renameSync(exitFile, claim);
+      } catch {
+        return null; // another consumer claimed it
+      }
+      try {
+        const data = JSON.parse(readFileSync(claim, "utf-8"));
+        rmSync(claim, { force: true });
+        return interpretExitSidecar(data);
+      } catch {
+        try {
+          rmSync(claim, { force: true });
+        } catch {}
+        // Corrupt sidecar consumed (not retried): fall through to `.done`.
+      }
     }
   } catch {}
   try {

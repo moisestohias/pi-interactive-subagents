@@ -25,7 +25,7 @@ The socket is mandatory: it keeps all plugin control traffic off your terminal. 
 ## Lifecycle of a subagent
 
 1. **Spawn.** You (or the model) call `subagent({ agent: "scout", task: "Map the auth module" })`. The plugin:
-   - picks a unique name,
+   - picks a unique name (defaulted *and* explicit names are deduplicated against running, in-flight, and finished runs — an explicit `"X"` that is taken becomes `"X-2"`, reported in the ack details as `requestedName`/`renamed`),
    - creates a session file for the child,
    - snapshots its sandbox (tool allowlist, model, identity — so a later resume replays the exact same restrictions),
    - opens a **new kitty tab without stealing focus** and starts `pi` there with the task.
@@ -73,22 +73,26 @@ agents additionally notify you; user-driven agents stay quiet (you're already lo
 | `ask_question` | subagent only | Ask the parent a question and wait for the reply |
 | `/subagent <agent> <task>` | human | Slash-command shortcut for spawning |
 
-Spawning is permissioned: every spawn must name a known agent, and a subagent may only spawn what its `subagent_agents` profile field allows (`true` = any agent; a list = only those; missing/`false` = cannot spawn at all) — so a child can never escalate into a full-toolset session. Agents without a `tools` header run with a `read, write, edit, bash` baseline (`ask_question` always added).
+Spawning is permissioned: every spawn must name a known agent, and a subagent may only spawn what its `subagent_agents` profile field allows (`true` = any agent; a list = only those; missing/`false` = cannot spawn at all) — so a child can never escalate into a full-toolset session. Agents without a `tools` header run with a `read, write, edit, bash` baseline (`ask_question` always added). Note the baseline `bash` is pi's native tool, unwrapped: the `safe_bash` wrapper only loads when an agent literally lists `safe_bash`, and it is a best-effort guardrail, not a sandbox.
 
 ## How the pieces fit (files)
 
-- `pi-extension/subagents/index.ts` — the orchestrator side: tools, launch/resume builders, watchers, widget, notifications. Runs in your session.
-- `pi-extension/subagents/kitty.ts` — the only terminal-dependent layer: open tab, send text, read screen, close tab, detect exit. Everything else is terminal-agnostic. 
-- `pi-extension/subagents/tmux.ts.archived` — the previous backend, kept for reference. Nothing imports it. 
-- `pi-extension/subagents/session.ts` — session files, name registry, sandbox snapshots, result/stats parsing. 
-- `pi-extension/subagents/activity.ts` + `status.ts` — child liveness reporting and its classification. 
-- `pi-extension/subagents/subagent-done.ts` — loaded *inside* each subagent: auto-exit on completion, error reporting, the `ask_question` tool.
-- `agents/` — bundled profiles (`scout`, `researcher`, `worker`). Add your own as `.md` files in `.pi/agents/`.
+- `pi-extension/subagents/index.ts` — thin orchestrator wiring: tool/command/renderer registration plus `session_start`/`session_shutdown` handling. The logic lives in the modules below; it runs in your session.
+- `pi-extension/subagents/agents.ts` — agent profiles: frontmatter parsing, discovery (bundled package dir → global `~/.pi/agent/agents/` → project `.pi/agents/`), spawn gating, tool→extension mapping.
+- `pi-extension/subagents/launch.ts` + `cli/claude.ts` — command builders: sandbox flags, env prefixes, task artifacts, launch scripts (pi and Claude paths).
+- `pi-extension/subagents/store.ts` — live identity: running runs, kept tabs, parallel-spawn reservations (single owner).
+- `pi-extension/subagents/notifications.ts` — the sole owner of parent-bound steer messages (`subagent_result` / `subagent_question` / `subagent_status`).
+- `pi-extension/subagents/widget.ts` + `format.ts` — widget rendering and elapsed/token/context formatters. `keep.ts` holds the keep/exit truth table; `names.ts`/`paths.ts` hold slug/path helpers; `config.ts` reads `config.json` fresh (refreshed on `session_start`).
+- `pi-extension/subagents/kitty.ts` — the only terminal-dependent layer: open tab, send text, read screen, close tab, detect exit. Everything else is terminal-agnostic.
+- `pi-extension/subagents/session/` (via the `session.ts` barrel) — session files (`io`), session-id index (`index-cache`), name registry (`registry`), sandbox snapshots (`loadout`), seeding (`seed`), stats (`stats`); retired branch helpers are quarantined in `legacy-branch.ts`.
+- `pi-extension/subagents/activity.ts` + `status.ts` + `status-bridge.ts` — child liveness reporting, its classification, and the bridge between them.
+- `pi-extension/subagents/subagent-done.ts` (+ pure helpers in `subagent-done-pure.ts`) — loaded *inside* each subagent: auto-exit on completion, error reporting, the `ask_question` tool.
+- Agent profiles — resolved in three tiers (bundled package dir, global `~/.pi/agent/agents/`, project `.pi/agents/`; later tiers override). Put yours wherever fits your setup.
 
 ## Signals at a glance
 
 Almost all coordination is **files + notifications**, not terminal tricks:
 
 - **Terminal** (kitty remote control, always over the socket): open tab, type into a tab, read a tab's screen for the exit sentinel, close a tab.
-- **Files**: session transcripts (results), `.exit` sidecar (failures), `.ask` file (questions), activity file (liveness), registry + sandbox snapshot (resume).
+- **Files**: session transcripts (results; torn lines are skipped, never fatal), `.exit` sidecar (failures; claimed atomically), `.ask` file (questions; written atomically, claimed via rename so concurrent watchers deliver exactly once), activity file (liveness), registry + sandbox snapshot (resume).
 - **Notifications** (extension → you, as new turns): `subagent_result` (finished), `subagent_question` (it asked something), `subagent_status` (stalled/recovered).

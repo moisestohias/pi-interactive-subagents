@@ -19,7 +19,7 @@ through one helper that always passes `--to`. See `HOW-IT-WORKS.md` requirements
 
 **Why:** both commands "always succeed, even if no text was sent to any window" (docs + `--help`). Steering a closed tab reports success while the message evaporates — the worst failure mode in an orchestration system, because both sides believe the other side has it (e.g. a reply to a parked `ask_question` that never arrives).
 
-**What we do:** `sendCommand` checks `windowExists()` (parsed from `kitty @ ls`) first and throws an honest "tab is gone" error the caller surfaces. Known residual: a TOCTOU race if the tab dies between check and send — accepted and noted in code; the next 1s poller tick surfaces the death anyway. Sends are rare (launch + human-scale replies), so the extra `ls` round-trip costs nothing steady-state.
+**What we do:** `sendCommand` checks liveness (parsed from `kitty @ ls`) first. A positively-gone tab throws an honest "tab is gone" error the caller surfaces; a *control-plane failure* (dead socket, corrupt `ls` JSON) throws a distinct retryable error instead of reporting death (`windowExistsOrNull()` tri-state; the boolean `windowExists()` wrapper is legacy). Kept-tab pruning and the resume double-open guard treat "unknown" conservatively — never prune a live tab on a socket hiccup, never double-open a session file. Known residual: a TOCTOU race if the tab dies between check and send — accepted and noted in code; the next 1s poller tick surfaces the death anyway. Sends are rare (launch + human-scale replies), so the extra `ls` round-trip costs nothing steady-state.
 
 ## 3. Always match by numeric `id:`, never by title
 
@@ -64,12 +64,12 @@ through one helper that always passes `--to`. See `HOW-IT-WORKS.md` requirements
 
 ## 8. Probe availability actively; fail at the boundary with the fix attached
 
-**Rule:** `isMuxAvailable()` gates every spawn/resume; every layer error carries the setup hint.
+**Rule:** `isKittyAvailable()` (canonical; `isMuxAvailable` remains as an alias) gates every spawn/resume; every layer error carries the setup hint.
 
 **Why:** env vars (`KITTY_WINDOW_ID`, even `KITTY_PID`) can be present while control is unusable (tty-only setup, stale socket, hardened auth). A cheap env check that says "available" followed by a mid-spawn failure strands a half-built subagent. Every error from the layer already includes `muxSetupHint()`, so the worst case is a clean
 refusal naming both config lines — never a half-spawn and never corruption.
 
-**What we do:** gate on socket + binary; wrap `kittenSync`/`kittenAsync` errors with the hint in one place (`createSurface` doesn't double-wrap). Password hardening (`KITTY_RC_PASSWORD`/rc-pass) needs no code — it's env passthrough — but never "fix" auth by downgrading the user's setting.
+**What we do:** gate on socket + binary; wrap `kittenSync`/`kittenAsync` errors with the hint in one place (`createSurface` doesn't double-wrap). The binary probe passes its argument positionally (no shell interpolation) and only caches positive results, so installing kitty is picked up without restarting pi. Password hardening (`KITTY_RC_PASSWORD`/rc-pass) needs no code — it's env passthrough — but never "fix" auth by downgrading the user's setting.
 
 ## 9. Keep the surface layer boring and total
 
@@ -77,4 +77,4 @@ refusal naming both config lines — never a half-spawn and never corruption.
 
 **Why:** every lesson above is enforced in exactly one place (`kitty.ts`: `--to` injection, id validation, existence check, extent choice, error wrapping). The orchestrator (`index.ts`) changed by one import plus strings, which is why the whole unit suite survived the migration untouched.
 
-**What we do:** same export surface as the archived tmux layer, no new API except `windowExists` (lesson 2's requirement). If kitty changes something, exactly one file changes.
+**What we do:** the layer owns *all* terminal contact; nothing above it shells out to kitty. API additions since the migration: `windowExistsOrNull` (lesson 2's tri-state requirement); `createSurfaceSplit` is deprecated (tabs-first, pass `createSurface`). The archived tmux layer is gone — no reference implementation remains. If kitty changes something, exactly one file changes.

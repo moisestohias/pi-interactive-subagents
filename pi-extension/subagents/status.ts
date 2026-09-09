@@ -1,6 +1,7 @@
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { formatElapsedDuration as formatElapsedDurationCanonical } from "./format.ts";
 
 export const SNAPSHOT_STALLED_AFTER_MS = 60_000;
 export const DEFAULT_STATUS_LINE_LIMIT = 4;
@@ -101,6 +102,13 @@ function requireBoolean(value: unknown, source: string, fieldName: string): bool
   return value;
 }
 
+function requirePositiveInt(value: unknown, source: string, fieldName: string): number {
+  if (typeof value !== "number" || !Number.isInteger(value) || value <= 0) {
+    invalidStatusConfig(source, `${fieldName} must be a positive integer`);
+  }
+  return value as number;
+}
+
 function rejectUnsupportedKeys(
   value: Record<string, unknown>,
   allowedKeys: string[],
@@ -140,13 +148,14 @@ function activityLabel(snapshot: Pick<StatusSnapshot, "activityLabel" | "activeS
 export function parseStatusConfig(rawConfig: unknown, source = "config.json"): StatusConfig {
   const config = requireObject(rawConfig, source, "root");
   const status = requireObject(config.status, source, "status");
-  rejectUnsupportedKeys(status, ["enabled"], source, "status");
+  rejectUnsupportedKeys(status, ["enabled", "lineLimit"], source, "status");
   const enabled = requireBoolean(status.enabled, source, "status.enabled");
+  const lineLimit =
+    status.lineLimit === undefined
+      ? DEFAULT_STATUS_LINE_LIMIT
+      : requirePositiveInt(status.lineLimit, source, "status.lineLimit");
 
-  return {
-    enabled,
-    lineLimit: DEFAULT_STATUS_LINE_LIMIT,
-  };
+  return { enabled, lineLimit };
 }
 
 export interface TabsConfig {
@@ -237,14 +246,7 @@ export function loadExtensionConfig(
 }
 
 export function formatElapsedDuration(ms: number): string {
-  const totalSeconds = Math.max(0, Math.floor(ms / 1000));
-  if (totalSeconds < 60) return `${totalSeconds}s`;
-
-  const hours = Math.floor(totalSeconds / 3600);
-  const minutes = Math.floor((totalSeconds % 3600) / 60);
-  if (hours > 0) return `${hours}h ${minutes}m`;
-
-  return `${minutes}m`;
+  return formatElapsedDurationCanonical(ms);
 }
 
 export function createStatusState(params: {

@@ -55,20 +55,20 @@ be delivered to the wrong place or nowhere.
 a null target) lost the question permanently with no trace. File signals are
 cheap to re-read and self-describing; the 1–2s retry costs nothing.
 
-**What we do:** `deliverPendingQuestion` returns `boolean`, unlinks only on
-success (malformed payloads are still dropped). Same posture in recovery.
+**What we do:** the child writes `.ask` atomically (tmp file + rename), and
+`deliverPendingQuestion` *claims* it via rename-before-read
+(`.ask.consuming-<pid>-<rand>`; `ENOENT` means another tick won, so concurrent
+1s/2s/recovery consumers deliver exactly once). Unlink only happens after a
+successful send; a failed send moves the claim back for the next tick.
+Truly corrupt claims (impossible via partial flush now) are dropped. Same
+posture in recovery.
 
 ## 5. Rebuild supervision on `session_start` — watchers die with the process
 
 **Rule:** every `session_start` replays orphan `.ask` recovery *and* re-attaches
 kept-tab monitors from the registry.
 
-**Why:** shutdown/reload aborts every watcher (`session_shutdown` clears the
-maps). Anything parked at that moment — an unanswered question, a live kept tab
-— becomes invisible to the fresh process. The registry (`surface` + session
-file) plus a liveness probe (`windowExists`) is sufficient to resurrect exactly
-the supervision that is still meaningful, and delivery consumes the file so a
-racing live tick can't double-fire.
+**Why:** `/reload` rotates the shared poll controller and aborts every watcher, while `session_shutdown` tears down only that session's watchers and kept monitors (per-session scoping — one session closing never cancels another's runs). Anything parked at that moment — an unanswered question, a live kept tab — becomes invisible to the fresh process. The registry (`surface` + session file) plus a liveness probe (alive = `windowExistsOrNull() !== false`, so a socket hiccup never prunes a live tab) is sufficient to resurrect exactly the supervision that is still meaningful, and atomic claiming means a racing live tick can't double-fire.
 
 **What we do:** `recoverPendingQuestions()` then registry scan in the
 `session_start` handler, each entry guarded so a bad row never breaks startup.
@@ -84,7 +84,32 @@ to the wrong tab.
 **What we do:** `keptKey(artifactDir, name)` everywhere; lookups always carry
 the caller's artifact dir.
 
-## 7. Make the invisible round-trip traceable while diagnosing
+## 7. Deduplicate explicit names — never steal a live handle
+
+**Rule:** apply `uniqueRunningName` to *every* spawn, defaulted or explicit.
+
+**Why:** two parallel `subagent({name:"X",…})` calls used to both launch, with
+the second overwriting the first's registry handle while steering (`Array.find`)
+hit whichever run came first — messages acknowledged to the wrong agent and a
+lost resume handle.
+
+**What we do:** every spawn is uniquified against running + reserved +
+registry (`"X"` → `"X-2"`, reported in the ack details as
+`requestedName`/`renamed`); the message path resolves through
+`resolveRunningByName` so any pre-existing duplicate surfaces an ambiguity
+error instead of steering at random.
+
+## 8. Kept tabs keep their original clock
+
+**Rule:** thread the run's `startTime` through `KeptTab`.
+
+**Why:** the kept monitor rebuilt its question carrier per tick with
+`startTime: Date.now()`, so every later question reported `elapsed ~0s`.
+
+**What we do:** `startTime` rides on the kept entry from the run that earned
+it (session-start rebuilds default to attach time).
+
+## 9. Make the invisible round-trip traceable while diagnosing
 
 **Rule:** when supervision fails silently, add temporary file tracing (watcher
 start/exit, `.ask` seen/sent, steer attempts, recovery hits), then remove it

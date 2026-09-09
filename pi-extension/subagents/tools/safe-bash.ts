@@ -1,9 +1,15 @@
 /**
- * Safe bash extension for the worker subagent.
- * Wraps the built-in bash tool with dangerous command blocking.
+ * Safe bash extension for subagents. Best-effort guardrail, NOT a sandbox.
  *
- * Loaded into a child pi process via `--extension` when an agent's `tools`
- * frontmatter lists `safe_bash`. See CUSTOM_TOOL_EXTENSIONS in ../index.ts.
+ * Loaded into a child pi process via `--extension` ONLY when an agent's
+ * `tools` frontmatter literally lists `safe_bash` (see getToolExtensionPath).
+ * The default baseline grants pi's native `bash` unwrapped — listing `bash`
+ * does not give you this wrapper. Do not present safe_bash as enforced unless
+ * the agent definition lists it.
+ *
+ * Blocking is regex-based over the raw command string: it catches the common
+ * accidents but is bypassable by a determined actor (`python3 -c '…'`,
+ * novel flag spellings, etc.). Never rely on it as a security boundary.
  */
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { createBashTool } from "@mariozechner/pi-coding-agent";
@@ -12,7 +18,12 @@ import { Type } from "@sinclair/typebox";
 const DANGEROUS_PATTERNS = [
 	/\brm\s+(-[a-zA-Z]*f[a-zA-Z]*\s+)?(-[a-zA-Z]*r[a-zA-Z]*\s+)?(\/|~\/?\s|~\/?\b)/,
 	/\brm\s+(-[a-zA-Z]*r[a-zA-Z]*\s+)?(-[a-zA-Z]*f[a-zA-Z]*\s+)?(\/|~\/?\s|~\/?\b)/,
+	// rm with end-of-flags or parent traversal reaching root
+	/\brm\b[^;|&`$]*--\s+\//,
+	/\brm\b[^;|&`$]*\/tmp\/\.\.\//,
 	/\bsudo\b/,
+	// sudo via env prefix
+	/\benv\b[^;|&`$]*\bsudo\b/,
 	/\bmkfs\b/,
 	/\bdd\s+if=/,
 	/:\(\)\s*\{\s*:\|:&\s*\}\s*;:/,
@@ -28,24 +39,51 @@ const DANGEROUS_PATTERNS = [
 	/\bkillall\b/,
 ];
 
-function isDangerous(command: string): string | null {
+/** Verbs that must not appear inside $() / `` / ${} expansions. */
+const BLOCKED_IN_SUBSTITUTION = [
+	/\brm\s+[^;]*-[a-zA-Z]*[rf]/,
+	/\bsudo\b/,
+	/\breboot\b/,
+	/\bshutdown\b/,
+	/\bmkfs\b/,
+	/\bdd\s+if=/,
+];
+
+function hasBlockedSubstitution(command: string): boolean {
+	const stripped = command.replace(/\\\n/g, " ");
+	// $() , ``, ${} — crude nesting-agnostic scan: check each expansion body.
+	const bodies: string[] = [];
+	const dollarParen = stripped.match(/\$\(([^)]*)\)/g) ?? [];
+	for (const m of dollarParen) bodies.push(m);
+	const backtick = stripped.match(/`([^`]*)`/g) ?? [];
+	for (const m of backtick) bodies.push(m);
+	for (const body of bodies) {
+		for (const pattern of BLOCKED_IN_SUBSTITUTION) {
+			if (pattern.test(body)) return true;
+		}
+	}
+	return false;
+}
+
+export function isDangerous(command: string): string | null {
 	const normalized = command.replace(/\\\n/g, " ");
 	for (const pattern of DANGEROUS_PATTERNS) {
 		if (pattern.test(normalized)) {
 			return `Command blocked by safe_bash: matches dangerous pattern ${pattern}`;
 		}
 	}
+	if (hasBlockedSubstitution(command)) {
+		return `Command blocked by safe_bash: blocked verb inside command substitution`;
+	}
 	return null;
 }
 
 export default function (pi: ExtensionAPI) {
-	const bashTool = createBashTool(process.cwd());
-
 	pi.registerTool({
 		name: "safe_bash",
 		label: "Safe Bash",
 		description:
-			"Execute a bash command. Blocks dangerous commands (rm -rf /, sudo, mkfs, etc.).",
+			"Execute a bash command. Best-effort block on dangerous commands (rm -rf /, sudo, mkfs, etc.). Not a sandbox — bypassable by determined input.",
 		parameters: Type.Object({
 			command: Type.String({ description: "Bash command to execute" }),
 			timeout: Type.Optional(
@@ -57,7 +95,21 @@ export default function (pi: ExtensionAPI) {
 			if (danger) {
 				throw new Error(danger);
 			}
-			return bashTool.execute(toolCallId, params, signal, onUpdate);
+			// Resolve cwd per call (M9): the process may have moved since the
+			// extension loaded, and the tool context carries the live cwd.
+			// Pass ctx through (previously dropped).
+			const cwd =
+				(ctx as unknown as { cwd?: unknown })?.cwd;
+			const effectiveCwd =
+				typeof cwd === "string" && cwd ? cwd : process.cwd();
+			const bashTool = createBashTool(effectiveCwd);
+			return (bashTool.execute as (...args: unknown[]) => unknown)(
+				toolCallId,
+				params,
+				signal,
+				onUpdate,
+				ctx,
+			);
 		},
 	});
 }

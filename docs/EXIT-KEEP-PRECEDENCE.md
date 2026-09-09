@@ -38,10 +38,11 @@ pi session and the tab.
 The legacy `PI_SUBAGENT_KEEP_TAB` env wire is **removed**. It is never set,
 never read, and explicitly scrubbed:
 
-- Parent (`pi-extension/subagents/index.ts`) loads `tabs.keepOpen` from
-  `config.json` (sole truth, reloaded on `/reload`) and the agent's `auto-exit`
-  from frontmatter, computes per-run `keepSurface = keepOpen && !autoExit` and
-  `effectiveAutoExit = !keepSurface`.
+- Parent (keep/exit rule canonical in `pi-extension/subagents/keep.ts` as
+  `resolveKeepDecision`, wired in `index.ts`) loads `tabs.keepOpen` from
+  `config.json` (sole truth, re-read fresh — refreshed on `session_start`)
+  and the agent's `auto-exit` from frontmatter, computes per-run
+  `keepSurface = keepOpen && !autoExit` and `effectiveAutoExit = !keepSurface`.
   - `effectiveAutoExit` is encoded into the child's `PI_SUBAGENT_AUTO_EXIT=1`.
     Note this means a `keepOpen: false` + `auto-exit: false` agent still gets
     `PI_SUBAGENT_AUTO_EXIT=1` — the global forces exit.
@@ -118,11 +119,26 @@ auto-exit: false  // with keepOpen:true → KEEP (stays open + .done once)
 ---
 ```
 
+## Config reference
+
+```jsonc
+// config.json — global switch (+ status options)
+{
+  "status": { "enabled": true, "lineLimit": 4 },
+  "tabs": { "keepOpen": true }
+}
+```
+
+- `status.lineLimit` (positive int, default `4`) caps how many stall/recovery
+  lines one notification carries. Unknown/invalid config keys fail loudly
+  (invalid files are logged and surfaced, never silently defaulted) — only a
+  *missing* config falls back to defaults.
+
 ## Files
 
-- `pi-extension/subagents/index.ts` — `shouldKeepSurface()` (global, legacy),
-  `shouldKeepSurfaceFor()` / `shouldKeepForAgent()` (per-agent rule),
+- `pi-extension/subagents/keep.ts` — `resolveKeepDecision()` (the rule) +
+  per-agent/resume variants; `index.ts` keeps thin `shouldKeep*` wrappers.
   `maybeCloseSurface(surface, keepSurface?)`, `RunningSubagent.keepSurface/autoExit`.
 - `pi-extension/subagents/subagent-done.ts` — child exit/`.done` on `PI_SUBAGENT_AUTO_EXIT` only.
-- `pi-extension/subagents/kitty.ts` — `takeCompletionSidecar` (`.exit` > `.done`).
-- `pi-extension/subagents/status.ts` — `parseTabsConfig` / `loadExtensionConfig`.
+- `pi-extension/subagents/kitty.ts` — `takeCompletionSidecar` (`.exit` > `.done`, claimed atomically so a corrupt sidecar can't poison the poll loop).
+- `pi-extension/subagents/status.ts` — `parseTabsConfig` / `parseStatusConfig` / `loadExtensionConfig`; `config.ts` — fresh reads + `session_start` refresh.

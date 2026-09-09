@@ -27,99 +27,34 @@
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { Box, Text } from "@mariozechner/pi-tui";
 import { Type } from "@sinclair/typebox";
-import { writeFileSync } from "node:fs";
+import { renameSync, writeFileSync } from "node:fs";
 import { createSubagentActivityRecorder } from "./activity.ts";
+import {
+  shouldMarkUserTookOver as shouldMarkUserTookOverFn,
+  runningChildrenCount as runningChildrenCountFn,
+  shouldAutoExitOnAgentEnd as shouldAutoExitOnAgentEndFn,
+  findLatestAssistantError as findLatestAssistantErrorFn,
+  parseDeniedTools as parseDeniedToolsFn,
+} from "./subagent-done-pure.ts";
 
-export function shouldMarkUserTookOver(agentStarted: boolean): boolean {
-  return agentStarted;
-}
-
-/**
- * Number of child subagents this session itself still has in flight.
- *
- * When this extension is loaded inside a subagent that can spawn its own
- * children (e.g. a worker delegating to scout/researcher), `index.ts` runs in
- * the same process and publishes a live count through a shared process-global
- * symbol. A subagent that spawns children and then writes a "waiting for
- * results" message would otherwise auto-exit the instant that turn ends —
- * killing the session before its children report back. Reading this count lets
- * `agent_end` keep the session open until every child has finished and its
- * result has been delivered.
- *
- * Returns 0 when the spawning tools aren't loaded (scout/researcher, or a
- * standalone session), so those agents auto-exit exactly as before.
- */
-export function runningChildrenCount(): number {
-  const fn = (globalThis as any)[Symbol.for("pi-subagents/running-children-count")];
-  if (typeof fn !== "function") return 0;
-  try {
-    const n = fn();
-    return typeof n === "number" && n > 0 ? n : 0;
-  } catch {
-    return 0;
-  }
-}
-
-export function shouldAutoExitOnAgentEnd(
-  _userTookOver: boolean,
-  messages: any[] | undefined,
-): boolean {
-  // Manual input should not strand an auto-exit subagent. If the latest agent
-  // turn completed normally, close the session. Escape/abort still leaves it
-  // open for inspection or another prompt.
-  //
-  // stopReason: "error" (e.g. exhausted retries on a provider overload) also
-  // returns true — we want to shut down so the parent is woken up — but we
-  // pair this with findLatestAssistantError() so the parent learns it was an
-  // error, not a clean completion.
-  if (messages) {
-    for (let i = messages.length - 1; i >= 0; i--) {
-      const msg = messages[i];
-      if (msg?.role === "assistant") {
-        return msg.stopReason !== "aborted";
-      }
-    }
-  }
-
-  return true;
-}
-
-export interface SubagentErrorInfo {
-  errorMessage: string;
-  stopReason: "error";
-}
+export {
+  shouldMarkUserTookOver,
+  runningChildrenCount,
+  shouldAutoExitOnAgentEnd,
+  findLatestAssistantError,
+  parseDeniedTools,
+} from "./subagent-done-pure.ts";
+export type { SubagentErrorInfo } from "./subagent-done-pure.ts";
 
 /**
- * If the last assistant message in the turn ended with `stopReason: "error"`
- * (typically auto-retry exhausted on an overload / rate limit / server error),
- * return its error info so the parent orchestrator can surface a clear
- * failure instead of silently treating the run as completed.
- *
- * Returns `null` when the latest assistant turn completed normally or was
- * aborted by the user (handled separately by shouldAutoExitOnAgentEnd).
+ * Atomic `.ask` signal write (C3): tmp file + rename so parent polls never
+ * observe a partway-flushed payload. Exported for tests.
  */
-export function findLatestAssistantError(
-  messages: any[] | undefined,
-): SubagentErrorInfo | null {
-  if (!messages) return null;
-  for (let i = messages.length - 1; i >= 0; i--) {
-    const msg = messages[i];
-    if (msg?.role !== "assistant") continue;
-    if (msg.stopReason !== "error") return null;
-    const raw = typeof msg.errorMessage === "string" ? msg.errorMessage.trim() : "";
-    return {
-      errorMessage: raw || "Subagent agent loop ended with stopReason=error (no errorMessage field).",
-      stopReason: "error",
-    };
-  }
-  return null;
-}
-
-export function parseDeniedTools(rawValue: string | undefined): string[] {
-  return (rawValue ?? "")
-    .split(",")
-    .map((value) => value.trim())
-    .filter(Boolean);
+export function writeAskSignalAtomic(sessionFile: string, data: unknown): void {
+  const target = `${sessionFile}.ask`;
+  const tmp = `${target}.tmp-${process.pid}-${Math.random().toString(16).slice(2, 8)}`;
+  writeFileSync(tmp, JSON.stringify(data), "utf8");
+  renameSync(tmp, target);
 }
 
 export default function (pi: ExtensionAPI) {
@@ -214,7 +149,7 @@ export default function (pi: ExtensionAPI) {
     recorder.sessionStart();
     const tools = pi.getAllTools();
     toolNames = tools.map((t) => t.name).sort();
-    denied = parseDeniedTools(deniedToolsValue);
+    denied = parseDeniedToolsFn(deniedToolsValue);
 
     renderWidget(ctx, null);
   });
@@ -232,7 +167,7 @@ export default function (pi: ExtensionAPI) {
     awaitingAnswer = false;
     // Ignore the initial task message that starts an autonomous subagent.
     // Only inputs after the first agent run has started count as user takeover.
-    if (!shouldMarkUserTookOver(agentStarted)) return;
+    if (!shouldMarkUserTookOverFn(agentStarted)) return;
     userTookOver = true;
   });
 
@@ -257,11 +192,11 @@ export default function (pi: ExtensionAPI) {
     //    would strand those children and drop their results.
     // In both cases the session parks as `waiting` and resumes when the next
     // turn lands.
-    const hasPendingChildren = runningChildrenCount() > 0;
+    const hasPendingChildren = runningChildrenCountFn() > 0;
     const finishedTurn =
       !awaitingAnswer &&
       !hasPendingChildren &&
-      shouldAutoExitOnAgentEnd(userTookOver, messages);
+      shouldAutoExitOnAgentEndFn(userTookOver, messages);
     const shouldExit = finishedTurn && autoExit;
 
     if (shouldExit) {
@@ -270,7 +205,7 @@ export default function (pi: ExtensionAPI) {
       // can report a clear failure with the underlying error message.
       // Without this the parent would only see exit code 0 and a stale
       // assistant message, mistaking the crash for a successful completion.
-      const errorInfo = findLatestAssistantError(messages);
+      const errorInfo = findLatestAssistantErrorFn(messages);
       const sessionFile = process.env.PI_SUBAGENT_SESSION;
       if (errorInfo && sessionFile) {
         try {
@@ -299,7 +234,7 @@ export default function (pi: ExtensionAPI) {
     if (!autoExit && finishedTurn && !completionSignaled) {
       completionSignaled = true;
       const sessionFile = process.env.PI_SUBAGENT_SESSION;
-      const errorInfo = findLatestAssistantError(messages);
+      const errorInfo = findLatestAssistantErrorFn(messages);
       if (sessionFile) {
         try {
           if (errorInfo) {
@@ -425,7 +360,9 @@ export default function (pi: ExtensionAPI) {
         agent: process.env.PI_SUBAGENT_AGENT ?? "",
         question: params.question,
       };
-      writeFileSync(`${sessionFile}.ask`, JSON.stringify(askData));
+      // Atomic write (C3): tmp + rename so a 1s parent poll never reads a
+      // partway-flushed `.ask` and deletes it as "malformed".
+      writeAskSignalAtomic(sessionFile, askData);
 
       return {
         content: [

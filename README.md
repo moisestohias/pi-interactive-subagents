@@ -2,7 +2,7 @@
 
 Async subagents for [pi](https://github.com/badlogic/pi-mono), running in kitty tabs. Spawn a sub-agent, keep working in the main session, and get the result steered back when it finishes. Fully non-blocking.
 
-**kitty-tabs fork** (migrated from tmux; the old surface layer is preserved as `pi-extension/subagents/tmux.ts.archived`). See [Acknowledgements](#acknowledgements) for the upstream project, which also supports cmux, zellij, and WezTerm.
+**kitty-tabs fork** (migrated from tmux; the old surface layer has since been removed — `pi-extension/subagents/kitty.ts` is the only terminal layer). See [Acknowledgements](#acknowledgements) for the upstream project, which also supports cmux, zellij, and WezTerm.
 
 ## How it works
 
@@ -190,7 +190,7 @@ gitignored). Applies on `/reload`, no pi restart needed:
 
 ```json
 {
-  "status": { "enabled": true },
+  "status": { "enabled": true, "lineLimit": 4 },
   "tabs": { "keepOpen": false }
 }
 ```
@@ -198,6 +198,7 @@ gitignored). Applies on `/reload`, no pi restart needed:
 | Key | Default | Description |
 | --- | ------- | ----------- |
 | `status.enabled` | `true` | Live per-subagent status in the widget (active tool, waits, stall/recovery pings) |
+| `status.lineLimit` | `4` | Max stall/recovery lines per status notification (positive int; invalid config fails loudly instead of silently defaulting) |
 | `tabs.keepOpen` | `false` | Global keep switch: `false` always closes session + tab; `true` delegates to the agent's `auto-exit` (`true` closes, `false` leaves tab open with pi interactive — see `docs/EXIT-KEEP-PRECEDENCE.md`) |
 
 ## Requirements

@@ -15,6 +15,20 @@ detached process fails with `open /dev/tty`). Details in §5.1.
 > Scope note: per the request, `tmux.ts` is **not** renamed/deleted yet — this file is the analysis deliverable.
 > The planned archive step is `git mv pi-extension/subagents/tmux.ts pi-extension/subagents/tmux.ts.archived`
 > at implementation time (§7).
+>
+> **Implementation status (later additions — body below is the original analysis, kept as record):**
+> migration landed (`kitty.ts` replaced `tmux.ts`; §7 done). Since then:
+> `tmux.ts.archived` was removed entirely; `createSurfaceSplit` is deprecated
+> (tabs-first, use `createSurface`); canonical availability names are
+> `isKittyAvailable()`/`kittySetupHint()` (`isMuxAvailable`/`muxSetupHint` remain
+> as aliases); existence checks are tri-state (`windowExistsOrNull()` — control-plane
+> failure is distinct from tab-gone, and pruning/guard paths treat "unknown"
+> conservatively); the binary probe passes its argument positionally and only
+> caches positives. Claude-hook autonomy is still "exactly 1 human message",
+> but array-content human blocks now count (pure `tool_result` arrays don't),
+> with a node fallback when python3 is absent (see `plugin/hooks/on-stop.sh`).
+> Current behavior is documented in `HOW-IT-WORKS.md`, `KITTY-LESSONS.md`,
+> `LIFECYCLE-LESSONS.md` — consult those first.
 
 ---
 

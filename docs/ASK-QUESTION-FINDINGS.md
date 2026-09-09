@@ -78,3 +78,11 @@ never consumed by any live watcher).
   changes which precedence-table row, prompt mode, and spawn gate workers land on.
 - Temporary file tracing used during diagnosis is removed; the regression
   tests in `test/test.ts` (`ask_question delivery` suite) pin the fixed behavior.
+
+## Follow-up hardening (post-fix)
+
+- The `.ask` write is now atomic (tmp file + rename in `subagent-done.ts`) and
+  the parent *claims* it via rename-before-read, so concurrent 1s/2s/recovery
+  ticks deliver exactly once; failed sends restore the claim for retry and
+  corrupt claims are dropped (see `LIFECYCLE-LESSONS.md` §4). Single-delivery
+  is pinned by `test/bugfixes.test.ts`.

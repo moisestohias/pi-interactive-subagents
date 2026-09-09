@@ -10,7 +10,7 @@ subagent_agents: scout, researcher
 ---
 ```
 
-* **`true`:** child is launched with `--tools` including `subagent, subagent_message, subagents_list` (see `buildSubagentToolAllowlist` in `pi-extension/subagents/index.ts`) and this extension loaded via `-e`, with no `PI_SUBAGENT_ALLOWED` pin — it may spawn any discoverable agent.
+* **`true`:** child is launched with `--tools` including `subagent, subagent_message, subagents_list` (see `buildSubagentToolAllowlist` in `pi-extension/subagents/launch.ts`; agent types/gate in `pi-extension/subagents/agents.ts`) and this extension loaded via `-e`, with no `PI_SUBAGENT_ALLOWED` pin — it may spawn any discoverable agent.
 * **Non-empty list:** same toolset grant, but `PI_SUBAGENT_ALLOWED=<list>` is set. It may spawn only the listed agents (enforced via `permittedSet` in `subagent.execute`).
 * **Omitted, empty, or `false`:** no spawning tools, no `PI_SUBAGENT_ALLOWED` — the child cannot spawn at all. This is how `scout` / `researcher` work today.
 
