@@ -38,6 +38,11 @@ export function seedSubagentSessionFile(params: {
   childSessionFile: string;
   childCwd: string;
 }): void {
+  // Compat-6: `version: 3` tracks pi's internal session format BY HAND.
+  // If pi bumps its session schema, fork/lineage-only children seeded here
+  // silently diverge from the shape normal children get from pi itself.
+  // Re-check this header against the installed pi version whenever pi is
+  // upgraded (or, better, seed via pi itself and delete this literal).
   const header = {
     type: "session",
     version: 3,

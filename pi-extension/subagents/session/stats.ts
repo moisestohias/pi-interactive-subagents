@@ -26,6 +26,16 @@ export function summarizeSessionStats(sessionFile: string): SessionStats | null 
   } catch {
     return null;
   }
+  return summarizeEntriesStats(entries);
+}
+
+/**
+ * Stats over already-parsed entries (Missing #2). The completion path
+ * reads the transcript once via `readEntriesAfter` and derives both the
+ * summary and the stats from that single parse, instead of paying a second
+ * full read+parse inside `summarizeSessionStats`.
+ */
+export function summarizeEntriesStats(entries: SessionEntry[]): SessionStats {
 
   const stats: SessionStats = {
     model: null,

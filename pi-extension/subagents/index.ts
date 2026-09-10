@@ -13,6 +13,7 @@ import {
   copyFileSync,
   unlinkSync,
   renameSync,
+  statSync,
 } from "node:fs";
 import { homedir } from "node:os";
 import {
@@ -22,13 +23,18 @@ import {
   muxSetupHint,
   createSurface,
   sendCommand,
+  sendCommandAsync,
   sendLongCommand,
   pollForExit,
   closeSurface,
+  closeSurfaceAsync,
+  logCorruptDrop,
   shellEscape,
   readScreen,
   readScreenAsync,
-  windowExists,
+  // L4: `windowExists` (lossy boolean wrapper) is deliberately NOT imported
+  // — every prune path uses `windowExistsOrNull` so a control-plane hiccup
+  // (null) can never prune or report-death a live tab (N3).
   windowExistsOrNull,
 } from "./kitty.ts";
 // Canonical helpers (R1 split). index.ts keeps thin wrappers for test compat
@@ -75,6 +81,7 @@ import { getExtensionConfig, getSafeExtensionConfig, invalidateExtensionConfigCa
 import {
   buildClaudeCommand as buildClaudeCommandCanonical,
   copyClaudeSession as copyClaudeSessionCanonical,
+  createClaudeSentinelFile as createClaudeSentinelFileCanonical,
 } from "./cli/claude.ts";
 import {
   activityLabel as activityLabelCanonical,
@@ -103,7 +110,7 @@ import {
   registerName,
   resolveNameInRegistry,
   seedSubagentSessionFile,
-  summarizeSessionStats,
+  summarizeEntriesStats,
   writeSubagentLoadout,
   type SessionStats,
   type SubagentLoadout,
@@ -419,10 +426,20 @@ function resolveKeepDecision(opts: { keepOpen: boolean; autoExit: boolean }): { 
  * Pass the run's `keepSurface` decision; when omitted, falls back to the
  * global config (legacy call sites / tests).
  */
+/** Shared keep decision for the close pair (M11 single-home). */
+function shouldCloseSurface(keepSurface?: boolean): boolean {
+  return !(keepSurface ?? shouldKeepSurface());
+}
+
 function maybeCloseSurface(surface: string, keepSurface?: boolean): void {
-  const keep = keepSurface ?? shouldKeepSurface();
-  if (keep) return;
+  if (!shouldCloseSurface(keepSurface)) return;
   closeSurface(surface);
+}
+
+/** Async `maybeCloseSurface` (M11): adopted on completion paths. */
+async function maybeCloseSurfaceAsync(surface: string, keepSurface?: boolean): Promise<void> {
+  if (!shouldCloseSurface(keepSurface)) return;
+  await closeSurfaceAsync(surface);
 }
 
 function muxUnavailableResult() {
@@ -437,7 +454,10 @@ function muxUnavailableResult() {
   };
 }
 
-/** @deprecated Use kittySetupHint-backed muxUnavailableResult. Kept for test compat. */
+/**
+ * @deprecated Use muxUnavailableResult. Kept for test compat.
+ * (Lows: the trivial alias body is collapsed — the name remains.)
+ */
 function kittyUnavailableResult() {
   return muxUnavailableResult();
 }
@@ -684,6 +704,91 @@ function decideResurrectAction(state: {
   if (state.tracked || state.kept) return "skip";
   if (state.alive === false) return "prune";
   return "watch";
+}
+/**
+ * Reserved sidecar/claim filename suffixes (compat-3 protocol registry).
+ * These suffixes next to session files / inside artifact dirs are the
+ * parent↔child protocol — never use them for anything else, and never
+ * invent a new one without adding it here:
+ * - `.exit` — child error signal (JSON `{type:"error",…}`), rename-claimed.
+ * - `.done` — keep-tab clean-finish signal (presence = signal), rename-claimed.
+ * - `.ask` — child question payload (JSON), rename-claimed.
+ * - `.loadout.json` — spawn loadout snapshot for resume replay.
+ * - `.transcript` — Claude transcript path pointer (Claude backend only).
+ * - `.consuming-*` — transient rename-claim (pid+random); stale ones are
+ *   swept by `sweepStaleArtifacts`.
+ * - `.pending-*` — parked question payloads (M2 no-clobber queue).
+ * - `.tmp-*` — transient writer temp files (registry + atomic sidecars).
+ * - `.corrupt-retry` — compat-1 torn-`.ask` retry marker.
+ * - `.corrupt-<ts>` — M6 corrupt-registry backups (never swept: evidence).
+ */
+const STALE_CLAIM_MAX_AGE_MS = 5 * 60 * 1000;
+const STAGED_FILE_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
+const SWEPT_STAGING_DIRS = ["context", "subagent-scripts", "subagent-resume", "subagent-activity"];
+
+/**
+ * Best-effort artifact GC on `session_start` (L7 + compat-3).
+ * Launch/resume mint per-run files (sysprompt copies, launch/resume
+ * scripts, activity files) that were never cleaned — unbounded growth per
+ * run — and crashed processes leave `.consuming-*`/`.tmp-*` claim files
+ * behind. Sweeps, under the spawner's artifact dir only:
+ * - stale claim/tmp files older than 5 min (a live claim lives only
+ *   milliseconds; the grace keeps the sweep from racing a concurrent tick
+ *   during reload). M6 `.corrupt-*` backups are evidence — never swept.
+ * - staged files older than 7 days in the known staging subdirs.
+ * Never touches: the registry, session transcripts (they live outside the
+ * artifact dir), or live sidecars (`.ask`/`.done`/`.exit`/loadouts —
+ * owned by recovery, which runs separately).
+ */
+function sweepStaleArtifacts(artifactDir: string): void {
+  let removed = 0;
+  const now = Date.now();
+  const stagingRoots = new Set(SWEPT_STAGING_DIRS.map((d) => join(artifactDir, d)));
+  const walk = (dir: string, underStaging: boolean) => {
+    let entries: import("node:fs").Dirent[];
+    try {
+      entries = readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      const full = join(dir, entry.name);
+      if (entry.isDirectory()) {
+        walk(full, underStaging || stagingRoots.has(full));
+        continue;
+      }
+      if (!entry.isFile()) continue;
+      let mtime = 0;
+      try {
+        mtime = statSync(full).mtimeMs;
+      } catch {
+        continue;
+      }
+      const age = now - mtime;
+      const isClaimTmp =
+        entry.name.includes(".consuming-") ||
+        entry.name.includes(".tmp-");
+      if (isClaimTmp && !entry.name.includes(".corrupt-") && age > STALE_CLAIM_MAX_AGE_MS) {
+        try {
+          unlinkSync(full);
+          removed++;
+        } catch {}
+      } else if (underStaging && age > STAGED_FILE_MAX_AGE_MS) {
+        try {
+          unlinkSync(full);
+          removed++;
+        } catch {}
+      }
+    }
+  };
+  try {
+    walk(artifactDir, false);
+  } catch {}
+  if (removed > 0) {
+    try {
+      console.error(`[pi-subagents] swept ${removed} stale artifact file(s) under ${artifactDir}`);
+    } catch {}
+  }
 }
 /**
  * Re-watch a still-live run orphaned by `/reload` (H5). The previous module
@@ -1008,12 +1113,17 @@ function resolveRunningByName(name: string):
  * collapsed to spaces because each newline submits a turn in the child's TUI
  * editor; a multi-line message would otherwise fire as several partial turns.
  */
+/** Shared steer payload: newlines flattened (typed into a terminal). */
+function flattenSteerMessage(message: string): string {
+  return message.replace(/\s*\n\s*/g, " ").trim();
+}
+
 function steerSubagent(
   running: RunningSubagent,
   message: string,
   send: (surface: string, command: string) => void = sendCommand,
 ): { ok: true } | { error: string } {
-  const flattened = message.replace(/\s*\n\s*/g, " ").trim();
+  const flattened = flattenSteerMessage(message);
   try {
     send(running.surface, flattened);
     return { ok: true };
@@ -1026,9 +1136,48 @@ function steerSubagent(
   }
 }
 
-function handleSubagentSteer(
+/** True when the send failed because kitty liveness is unknown (Missing #3). */
+function isControlPlaneUnknownError(error: any): boolean {
+  return /control plane unreachable|socket hiccup/i.test(error?.message ?? String(error));
+}
+
+/**
+ * Async steer (M11): same delivery over `sendCommandAsync` so the
+ * control-plane round-trips don't block the extension host. Missing #3:
+ * one retry after a short delay when the control plane is *unknown*
+ * (transient socket hiccup) — steers were the only path with no retry
+ * while questions retry next tick by design. Positively-dead tabs fail
+ * fast with no retry. Sync `steerSubagent` stays for tests/startup.
+ */
+async function steerSubagentAsync(
+  running: RunningSubagent,
+  message: string,
+  send: (surface: string, command: string) => unknown = sendCommandAsync,
+): Promise<{ ok: true } | { error: string }> {
+  const flattened = flattenSteerMessage(message);
+  const fail = (error: any) => ({
+    error:
+      `Failed to deliver message to subagent "${running.name}" via kitty tab: ` +
+      `${error?.message ?? String(error)}`,
+  });
+  try {
+    await send(running.surface, flattened);
+    return { ok: true };
+  } catch (error: any) {
+    if (!isControlPlaneUnknownError(error)) return fail(error);
+    await new Promise<void>((r) => setTimeout(r, 250));
+    try {
+      await send(running.surface, flattened);
+      return { ok: true };
+    } catch (retryError: any) {
+      return fail(retryError);
+    }
+  }
+}
+
+async function handleSubagentSteer(
   params: { name?: string; message?: string },
-  send: (surface: string, command: string) => void = sendCommand,
+  send: (surface: string, command: string) => unknown = sendCommandAsync,
 ) {
   const message = params.message?.trim();
   if (!message) {
@@ -1048,7 +1197,7 @@ function handleSubagentSteer(
   const now = Date.now();
   observeRunningSubagent(running, now);
 
-  const steer = steerSubagent(running, message, send);
+  const steer = await steerSubagentAsync(running, message, send);
   if ("error" in steer) {
     return {
       content: [{ type: "text" as const, text: steer.error }],
@@ -1178,6 +1327,7 @@ export const __test__ = {
   shouldNotifyResult,
   restoreAskClaimNoClobber,
   decideResurrectAction,
+  steerSubagentAsync,
   sessionCtxs,
   startWidgetRefresh,
   startStatusRefresh,
@@ -1317,6 +1467,8 @@ async function launchSubagent(
       systemPrompt: agentDefs.body ?? null,
       cwd: targetCwdForSession ?? null,
     });
+    // L8: pre-create the sentinel mode 0600 (predictable /tmp name).
+    createClaudeSentinelFileCanonical(sentinelFile);
     const command = withDoneSentinelCanonical(claudeBase);
 
     const launchScriptName = `${slugifyName(params.name)}-${id}.sh`;
@@ -1560,7 +1712,13 @@ function recoverPendingQuestions(piInstance: ExtensionAPI, artifactDir: string):
     } catch {
       agent = undefined;
     }
-    deliverPendingQuestion({ name, agent, sessionFile, startTime: Date.now() }, piInstance);
+    // L3: recovered questions report real elapsed from the `.ask` file
+    // mtime (the question's actual age), not `Date.now()` ("asks (0s)").
+    let startTime = Date.now();
+    try {
+      startTime = Math.min(startTime, statSync(`${sessionFile}.ask`).mtimeMs);
+    } catch {}
+    deliverPendingQuestion({ name, agent, sessionFile, startTime }, piInstance);
   }
 }
 
@@ -1655,6 +1813,9 @@ function deliverPendingQuestion(running: QuestionCarrier, piInstance?: Extension
       if (existsSync(retryMarker)) {
         unlinkSync(claim);
         unlinkSync(retryMarker);
+        // Missing #4: the final drop is logged + counted — a torn `.ask`
+        // that never parses is a lost child question, never silent.
+        logCorruptDrop("ask-claim", askFile, "torn-json-second-failure");
       } else {
         writeFileSync(retryMarker, String(Date.now()), "utf8");
         restoreAskClaimNoClobber(claim, askFile);
@@ -1670,6 +1831,10 @@ function deliverPendingQuestion(running: QuestionCarrier, piInstance?: Extension
     try {
       unlinkSync(claim);
     } catch {}
+    // Missing #4: well-formed JSON without a question is not a real
+    // signal — but dropping it silently would hide a child-side contract
+    // break, so it is logged + counted too.
+    logCorruptDrop("ask-claim", askFile, "missing-question-field");
     return false;
   }
 
@@ -1768,18 +1933,24 @@ async function watchSubagent(
         try { unlinkSync(running.sentinelFile + ".transcript"); } catch {}
       }
 
-      maybeCloseSurface(surface, running.keepSurface);
+      await maybeCloseSurfaceAsync(surface, running.keepSurface);
       runningSubagents.delete(running.id);
 
       return { name, task, summary, exitCode: result.exitCode, elapsed, surfaceKept: running.keepSurface === true, ...(sessionId ? { claudeSessionId: sessionId } : {}) };
     }
 
-    // Pi subagent result extraction
+    // Pi subagent result extraction — Missing #2: a single read via
+    // `readEntriesAfter` feeds both the summary and the stats (previously a
+    // full parse here plus a second full read+parse in
+    // `summarizeSessionStats`, i.e. two sync multi-MB JSON parses per
+    // completion on the extension host).
     let summary: string;
+    let stats: SessionStats | null = null;
     if (existsSync(sessionFile)) {
-      const allEntries = getNewEntries(sessionFile, 0);
+      const read = readEntriesAfter(sessionFile, 0);
+      stats = summarizeEntriesStats(read.entries);
       summary =
-        findLastAssistantMessage(allEntries) ??
+        findLastAssistantMessage(read.entries) ??
         (result.errorMessage
           ? `Subagent error: ${result.errorMessage}`
           : result.exitCode !== 0
@@ -1793,10 +1964,9 @@ async function watchSubagent(
           : "Sub-agent exited without output";
     }
 
-    const stats = existsSync(sessionFile) ? summarizeSessionStats(sessionFile) : null;
     const subagentSessionId = existsSync(sessionFile) ? getSessionId(sessionFile) : null;
 
-    maybeCloseSurface(surface, running.keepSurface);
+    await maybeCloseSurfaceAsync(surface, running.keepSurface);
     runningSubagents.delete(running.id);
 
     return {
@@ -1951,6 +2121,15 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           }
         } catch {
           // Best effort — rebuild must never break session startup.
+        }
+        // L7/compat-3: best-effort artifact GC (stale claims + old staged
+        // files). Runs after recovery so it can never race a live claim
+        // the loops above just created; the 5-min claim grace covers the
+        // concurrent-tick race during reload.
+        try {
+          sweepStaleArtifacts(artifactDir);
+        } catch {
+          // Best effort — GC must never break session startup.
         }
       }
     } catch {
@@ -2421,6 +2600,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         "so the SAME name works whether the subagent is running or finished: if it is still running, your message steers its live session; " +
         "if it has finished, your message resumes that session and continues it. " +
         "`name` and `message` are both required. " +
+        "Keep steers human-scale (a paragraph or two): the message is typed into the child's terminal, so multi-KB pastes risk terminal line-wrap mangling — put long content in a file and point the subagent at the path instead. " +
         "Steering a running subagent returns immediately with a local acknowledgement and does NOT, by itself, emit a new result. " +
         "Resuming is a fire-and-forget async call: when the resumed sub-agent finishes, the harness AUTOMATICALLY delivers its result as a steer message that wakes you up. " +
         "DO NOT poll, sleep, tail logs, or read session files to detect completion — the harness handles delivery. " +
@@ -2586,7 +2766,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         if (entry.surface) {
           const kept = findKeptTab(parentArtifactDir, requestedName);
           if (kept) {
-            const steer = steerSubagent(
+            const steer = await steerSubagentAsync(
               { surface: kept.surface, name: kept.name } as RunningSubagent,
               params.message,
             );
@@ -2678,7 +2858,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             if (entry.surface) {
               const racedKept = findKeptTab(parentArtifactDir, requestedName);
               if (racedKept) {
-                const racedSteer = steerSubagent(
+                const racedSteer = await steerSubagentAsync(
                   { surface: racedKept.surface, name: racedKept.name } as RunningSubagent,
                   params.message,
                 );

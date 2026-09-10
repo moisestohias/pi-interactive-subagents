@@ -31,7 +31,7 @@ export {
 } from "./session/loadout.ts";
 export { seedSubagentSessionFile } from "./session/seed.ts";
 export type { SessionStats } from "./session/stats.ts";
-export { summarizeSessionStats } from "./session/stats.ts";
+export { summarizeSessionStats, summarizeEntriesStats } from "./session/stats.ts";
 // Deprecated branch helpers (quarantined, re-exported for compat).
 export {
   getLeafId,

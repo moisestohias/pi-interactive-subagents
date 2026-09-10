@@ -229,12 +229,13 @@ export function windowExists(surface: string): boolean {
  * Throws when the tab is gone, so callers surface delivery failure instead of
  * silently dropping the message.
  */
-export function sendCommand(surface: string, command: string): void {
-  requireKitty();
-  const match = matchFor(surface);
-  // N4: advisory pre-check only (TOCTOU — the tab can die between `ls` and
-  // send, and kitty send to a dead id succeeds silently). It turns the common
-  // closed-tab case into an honest error at the cost of one `ls` round-trip.
+/**
+ * Shared liveness pre-check for the send pair (M11 single-home): both
+ * `sendCommand` and `sendCommandAsync` fail closed identically — positively
+ * gone throws an honest error, control-plane unknown throws a retryable
+ * one (N4: advisory only, TOCTOU — the tab can die between check and send).
+ */
+function assertSurfaceAlive(surface: string): void {
   const alive = windowExistsOrNull(surface);
   if (alive === false) {
     throw new Error(`No such subagent tab (window id ${surface}) — it may have been closed.`);
@@ -244,8 +245,29 @@ export function sendCommand(surface: string, command: string): void {
       `Kitty control plane unreachable while sending to tab ${surface} (socket hiccup?) — retry; the tab may still be alive.`,
     );
   }
+}
+
+export function sendCommand(surface: string, command: string): void {
+  requireKitty();
+  const match = matchFor(surface);
+  assertSurfaceAlive(surface);
   kittenSync(["send-text", "--match", match, "--stdin"], command);
   kittenSync(["send-key", "--match", match, "enter"]);
+}
+
+/**
+ * Async `sendCommand` (M11): same pre-checks and errors, but the three
+ * control-plane round-trips yield to the event loop instead of blocking the
+ * extension host. Adopted on the steer + completion paths; startup and
+ * tests keep the sync version (deterministic, no sleep injection).
+ */
+export async function sendCommandAsync(surface: string, command: string): Promise<void> {
+  requireKitty();
+  const match = matchFor(surface);
+  // Same shared pre-check as the sync version (TOCTOU, see N4).
+  assertSurfaceAlive(surface);
+  await kittenAsync(["send-text", "--match", match, "--stdin"], command);
+  await kittenAsync(["send-key", "--match", match, "enter"]);
 }
 
 /**
@@ -346,6 +368,13 @@ export function closeSurface(surface: string): void {
   kittenSync(["close-window", "--match", match]);
 }
 
+/** Async `closeSurface` (M11): adopted on completion paths. */
+export async function closeSurfaceAsync(surface: string): Promise<void> {
+  requireKitty();
+  const match = matchFor(surface);
+  await kittenAsync(["close-window", "--match", match]);
+}
+
 // ── Exit polling ──
 
 export interface PollResult {
@@ -382,6 +411,29 @@ function interpretExitSidecar(data: any): PollResult {
     return { reason: "error", exitCode: 1, errorMessage };
   }
   return { reason: "done", exitCode: 0 };
+}
+
+/**
+ * Corrupt-drop observability (Missing #4). Every "drop as corrupt" path
+ * across the sidecar protocol logs here with a stable prefix AND bumps a
+ * per-kind counter, so torn-signal bugs are debuggable in the field instead
+ * of vanishing silently. Counts are exposed to tests via
+ * `corruptDropCountsForTest`; production can read them the same way.
+ */
+const corruptDropCounts = new Map<string, number>();
+
+export function logCorruptDrop(kind: string, path: string, reason: string): void {
+  try {
+    corruptDropCounts.set(kind, (corruptDropCounts.get(kind) ?? 0) + 1);
+  } catch {}
+  try {
+    console.error(`[pi-subagents corrupt-drop] kind=${kind} path=${path} reason=${reason}`);
+  } catch {}
+}
+
+/** Test seam (Missing #4): snapshot of corrupt-drop counters. */
+export function corruptDropCountsForTest(): Record<string, number> {
+  return Object.fromEntries(corruptDropCounts.entries());
 }
 
 /**
@@ -429,6 +481,9 @@ function takeCompletionSidecar(sessionFile: string, opts?: { ignoreDone?: boolea
           rmSync(claim, { force: true });
         } catch {}
         // Corrupt sidecar consumed (not retried): fall through to `.done`.
+        // Missing #4: never silent — a torn `.exit` is exactly the signal
+        // loss H3 was about, so it gets logged + counted.
+        logCorruptDrop("exit-sidecar", exitFile, "torn-json-consumed");
       }
     }
   } catch {}
@@ -454,7 +509,7 @@ function takeCompletionSidecar(sessionFile: string, opts?: { ignoreDone?: boolea
   return null;
 }
 
-export const __pollForExitTest__ = { interpretExitSidecar, takeCompletionSidecar };
+export const __pollForExitTest__ = { interpretExitSidecar, takeCompletionSidecar, corruptDropCountsForTest };
 
 /**
  * Poll until the subagent exits. Checks for a `.exit` sidecar file first

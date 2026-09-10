@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, writeFileSync, existsSync, renameSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
+import { fileURLToPath } from "node:url";
 
 // M5: lineLimit is now configurable and validated.
 import { parseStatusConfig } from "../pi-extension/subagents/status.ts";
@@ -48,8 +49,23 @@ describe("M5 status.lineLimit", () => {
     assert.throws(() => parseStatusConfig({ status: { enabled: true, lineLimit: "many" } }, "test"));
   });
 
-  it("still rejects unknown status keys", () => {
-    assert.throws(() => parseStatusConfig({ status: { enabled: true, bogus: 1 } }, "test"));
+  it("warns-and-ignores unknown keys; wrong types still throw (compat-5)", () => {
+    // Compat-5: a config written by a newer version (new key) must not
+    // hard-fail an older extension — warn-and-ignore. Wrong *types* on
+    // known keys stay loud (AGENTS.md rule 5).
+    const warnings: string[] = [];
+    const origWarn = console.warn;
+    console.warn = (msg: unknown) => void warnings.push(String(msg));
+    try {
+      assert.deepEqual(parseStatusConfig({ status: { enabled: true, bogus: 1 } }, "test"), {
+        enabled: true,
+        lineLimit: 4,
+      });
+    } finally {
+      console.warn = origWarn;
+    }
+    assert.ok(warnings.some((w) => w.includes("bogus")), "unknown key warned");
+    assert.throws(() => parseStatusConfig({ status: { enabled: "yes" } }, "test"));
   });
 });
 
@@ -662,6 +678,327 @@ describe("H5 reload resurrection", () => {
         if ((r as any).name === "Orphan") running.delete(id);
       }
       try { shut(undefined, ctx); } catch {}
+    }
+  });
+});
+
+describe("L1 safe_bash substitution bodies", () => {
+  it("scans ${…} bodies (comment used to claim this falsely)", async () => {
+    const { isDangerous } = await import("../pi-extension/subagents/tools/safe-bash.ts");
+    assert.ok(isDangerous("echo ${sudo whoami}"), "${sudo} blocked");
+    assert.ok(isDangerous("echo $(sudo whoami)"), "$(sudo) still blocked");
+    assert.ok(isDangerous("echo `sudo whoami`"), "backtick sudo still blocked");
+    assert.equal(isDangerous("echo ${HOME}/bin"), null, "benign ${…} passes");
+  });
+
+  it("pins intentional overblock dispositions", async () => {
+    const { isDangerous } = await import("../pi-extension/subagents/tools/safe-bash.ts");
+    // Both stay blocked by design (false positives preferred on footguns).
+    assert.ok(isDangerous("chmod 777 /tmp/x"), "chmod 777 /tmp blocked");
+    assert.ok(isDangerous("dd if=/dev/zero of=/dev/null bs=1M count=1"), "read-only dd blocked");
+  });
+});
+
+describe("L2 stop-hook structured messages", () => {
+  it("sentinel stays valid JSON for non-string last_assistant_message", async () => {
+    const { execFileSync } = await import("node:child_process");
+    let hasBash = true;
+    try {
+      execFileSync("bash", ["--version"], { stdio: "ignore" });
+    } catch {
+      hasBash = false;
+    }
+    if (!hasBash) return;
+    const hook = new URL(
+      "../pi-extension/subagents/plugin/hooks/on-stop.sh",
+      import.meta.url,
+    );
+    const dir = mkdtempSync(join(tmpdir(), "l2-"));
+    const sentinel = join(dir, "sentinel");
+    const transcript = join(dir, "t.jsonl");
+    writeFileSync(
+      transcript,
+      JSON.stringify({ type: "user", message: { role: "user", content: "do it" } }) + "\n",
+    );
+    const input = JSON.stringify({
+      transcript_path: transcript,
+      last_assistant_message: { text: "done ✓", code: 0 },
+    });
+    execFileSync("bash", [fileURLToPath(hook)], {
+      input,
+      env: { ...process.env, PI_CLAUDE_SENTINEL: sentinel },
+      stdio: ["pipe", "ignore", "ignore"],
+    });
+    assert.ok(existsSync(sentinel), "sentinel written for autonomous run");
+    assert.deepEqual(JSON.parse(readFileSync(sentinel, "utf8")), { text: "done ✓", code: 0 });
+  });
+});
+
+describe("L3 recovered-question elapsed", () => {
+  it("reports the .ask mtime age, not 0s", async () => {
+    const subagents = await import("../pi-extension/subagents/index.ts");
+    const { getArtifactDir } = await import("../pi-extension/subagents/paths.ts");
+    const { registerName } = await import("../pi-extension/subagents/session/registry.ts");
+    const { utimesSync } = await import("node:fs");
+    const dir = mkdtempSync(join(tmpdir(), "l3-"));
+    const sid = "sessL3";
+    const art = getArtifactDir(dir, sid);
+    const sessionFile = join(dir, "child.jsonl");
+    writeFileSync(sessionFile, JSON.stringify({ type: "session", id: "c1" }) + "\n");
+    registerName(art, "Orphan2", { sessionFile, sessionId: "c1" });
+    writeFileSync(`${sessionFile}.ask`, JSON.stringify({ name: "Orphan2", question: "old?" }));
+    const ageMs = 90 * 1000;
+    const past = new Date(Date.now() - ageMs);
+    utimesSync(`${sessionFile}.ask`, past, past);
+    const seen: string[] = [];
+    const handlers: Record<string, Function[]> = {};
+    const api = {
+      on: (e: string, h: Function) => void ((handlers[e] ??= []).push(h)),
+      registerTool: () => {},
+      registerCommand: () => {},
+      registerMessageRenderer: () => {},
+      sendMessage: (m: any) => void seen.push(m.content),
+      sendUserMessage: () => {},
+      getAllTools: () => [],
+    } as any;
+    (subagents as any).default(api);
+    const ctx = mockSessionCtx(dir, sid);
+    try {
+      handlers["session_start"][0](undefined, ctx);
+      assert.ok(seen.length > 0, "recovered question delivered");
+      assert.match(seen[0], /1m 30s/, `real elapsed shown, got: ${seen[0].slice(0, 80)}`);
+    } finally {
+      try { handlers["session_shutdown"][0](undefined, ctx); } catch {}
+    }
+  });
+});
+
+describe("L8 claude hardening", () => {
+  it("refuses transcript copies outside the allowlist", async () => {
+    const claude = await import("../pi-extension/subagents/cli/claude.ts");
+    const dir = mkdtempSync(join(tmpdir(), "l8-"));
+    const sentinel = join(dir, "s-done");
+    writeFileSync(`${sentinel}.transcript`, "/etc/hostname\n");
+    const errors: string[] = [];
+    const orig = console.error;
+    console.error = (...a: any[]) => void errors.push(a.join(" "));
+    try {
+      assert.equal(claude.copyClaudeSession(sentinel), null);
+    } finally {
+      console.error = orig;
+    }
+    assert.ok(errors.some((e) => e.includes("allowlist")), "refusal logged");
+    assert.ok(
+      claude.claudeTranscriptAllowlist().some((d) => d.endsWith(join(".claude", "projects"))),
+      "allowlist rooted at ~/.claude/projects",
+    );
+  });
+
+  it("pre-creates the sentinel mode 0600 (and tightens existing)", async () => {
+    const claude = await import("../pi-extension/subagents/cli/claude.ts");
+    const { statSync: ss, chmodSync } = await import("node:fs");
+    const dir = mkdtempSync(join(tmpdir(), "l8-mode-"));
+    const sentinel = join(dir, "s-done");
+    claude.createClaudeSentinelFile(sentinel);
+    assert.equal(ss(sentinel).mode & 0o777, 0o600);
+    chmodSync(sentinel, 0o644);
+    claude.createClaudeSentinelFile(sentinel);
+    assert.equal(ss(sentinel).mode & 0o777, 0o600);
+  });
+});
+
+describe("compat-2 registry version", () => {
+  it("writes version 1 and carries a newer marker across writes", async () => {
+    const { registerName, readNameRegistry, nameRegistryPath } =
+      await import("../pi-extension/subagents/session/registry.ts");
+    const dir = mkdtempSync(join(tmpdir(), "compat2-"));
+    registerName(dir, "a", { sessionFile: "/a.jsonl", sessionId: "1" });
+    assert.equal(JSON.parse(readFileSync(nameRegistryPath(dir), "utf8")).version, 1);
+    assert.equal("version" in readNameRegistry(dir), false, "marker is not a name entry");
+    // A newer schema tag survives an older writer (no silent downgrade).
+    const seeded = { version: 99, a: { sessionFile: "/a.jsonl", sessionId: "1" } };
+    writeFileSync(nameRegistryPath(dir), JSON.stringify(seeded));
+    registerName(dir, "b", { sessionFile: "/b.jsonl", sessionId: "2" });
+    const raw = JSON.parse(readFileSync(nameRegistryPath(dir), "utf8"));
+    assert.equal(raw.version, 99);
+    assert.equal(raw.b.sessionId, "2");
+  });
+});
+
+describe("compat pins", () => {
+  it("Symbol.for / global keys are literal-pinned", async () => {
+    const root = new URL("../pi-extension/subagents/", import.meta.url);
+    const indexSrc = readFileSync(new URL("index.ts", root), "utf8");
+    const agentsSrc = readFileSync(new URL("agents.ts", root), "utf8");
+    const donePureSrc = readFileSync(new URL("subagent-done-pure.ts", root), "utf8");
+    for (const key of [
+      "pi-subagents/widget-interval",
+      "pi-subagents/status-interval",
+      "pi-subagents/poll-abort-controller",
+    ]) {
+      assert.ok(indexSrc.includes(`"${key}"`), key);
+    }
+    assert.ok(
+      indexSrc.includes('"pi-subagents/running-children-count"') &&
+        donePureSrc.includes('"pi-subagents/running-children-count"'),
+      "children count (writer + reader agree on the literal)",
+    );
+    assert.ok(agentsSrc.includes('"pi-subagents/tool-extensions"'), "tool extensions");
+    assert.ok(
+      indexSrc.includes("__pi_interactive_subagents") ||
+        agentsSrc.includes("__pi_interactive_subagents"),
+      "legacy global",
+    );
+  });
+});
+
+describe("M11 async steer/close + Missing #3 retry", () => {
+  it("steerSubagentAsync delivers via injected async send", async () => {
+    const calls: Array<[string, string]> = [];
+    const r = await testApi.steerSubagentAsync(
+      { surface: "7", name: "W" } as any,
+      "do this\nthen that",
+      async (surface: string, text: string) => void calls.push([surface, text]),
+    );
+    assert.deepEqual(r, { ok: true });
+    assert.deepEqual(calls, [["7", "do this then that"]]);
+  });
+
+  it("retries once on control-plane unknown, fails fast when dead", async () => {
+    let n = 0;
+    const flaky = async () => {
+      if (++n === 1) throw new Error("Kitty control plane unreachable (socket hiccup?) — retry");
+    };
+    const r = await testApi.steerSubagentAsync({ surface: "7", name: "W" } as any, "hi", flaky);
+    assert.deepEqual(r, { ok: true });
+    assert.equal(n, 2);
+    let m = 0;
+    const dead = async () => {
+      m++;
+      throw new Error("No such subagent tab (window id 7) — it may have been closed.");
+    };
+    const r2 = await testApi.steerSubagentAsync({ surface: "7", name: "W" } as any, "hi", dead);
+    assert.ok("error" in r2);
+    assert.equal(m, 1, "no retry when positively dead");
+  });
+
+  it("async kitty variants fail closed like the sync ones", async () => {
+    const kitty = await import("../pi-extension/subagents/kitty.ts");
+    await assert.rejects(() => kitty.sendCommandAsync("nope", "hi"));
+    await assert.rejects(() => kitty.closeSurfaceAsync("nope"));
+  });
+});
+
+describe("Missing #2 single-read completion", () => {
+  it("summarizeEntriesStats matches summarizeSessionStats", async () => {
+    const { readEntriesAfter } = await import("../pi-extension/subagents/session/io.ts");
+    const { summarizeSessionStats, summarizeEntriesStats } =
+      await import("../pi-extension/subagents/session/stats.ts");
+    const sid = JSON.stringify({ type: "session", id: "s" });
+    const msg = JSON.stringify({
+      type: "message",
+      id: "m1",
+      message: {
+        role: "assistant",
+        model: "m",
+        content: [{ type: "text", text: "hi" }, { type: "toolCall", name: "read" }],
+        usage: { input: 10, output: 5, totalTokens: 100, cost: { total: 0.01 } },
+      },
+    });
+    const f = sessionFileWithRaw([sid, "{torn", msg].join("\n") + "\n");
+    const { entries } = readEntriesAfter(f, 0);
+    assert.deepEqual(summarizeEntriesStats(entries), summarizeSessionStats(f));
+    assert.equal(summarizeEntriesStats(entries)?.inputTokens, 10);
+  });
+});
+
+describe("Missing #4 corrupt drops are logged + counted", () => {
+  it("torn .exit drop logs with the stable prefix and bumps the counter", async () => {
+    const { __pollForExitTest__ } = await import("../pi-extension/subagents/kitty.ts");
+    const dir = mkdtempSync(join(tmpdir(), "m4drop-"));
+    const sf = join(dir, "s.jsonl");
+    writeFileSync(sf, JSON.stringify({ type: "session", id: "s" }) + "\n");
+    writeFileSync(`${sf}.exit`, "{torn");
+    const before = __pollForExitTest__.corruptDropCountsForTest()["exit-sidecar"] ?? 0;
+    const errors: string[] = [];
+    const orig = console.error;
+    console.error = (...a: any[]) => void errors.push(a.join(" "));
+    let result;
+    try {
+      result = __pollForExitTest__.takeCompletionSidecar(sf);
+    } finally {
+      console.error = orig;
+    }
+    assert.equal(result, null);
+    assert.equal(__pollForExitTest__.corruptDropCountsForTest()["exit-sidecar"], before + 1);
+    assert.ok(errors.some((e) => e.includes("[pi-subagents corrupt-drop]")), "stable prefix");
+  });
+
+  it("second-failure .ask drop logs and counts", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "m4ask-"));
+    const sessionFile = join(dir, "s.jsonl");
+    writeFileSync(sessionFile, JSON.stringify({ type: "session", id: "s" }) + "\n");
+    writeFileSync(`${sessionFile}.ask`, "{torn");
+    const pi = { sendMessage: () => { throw new Error("must not send"); } } as any;
+    const carrier = { name: "w", sessionFile, startTime: Date.now() };
+    const { __pollForExitTest__ } = await import("../pi-extension/subagents/kitty.ts");
+    const before = __pollForExitTest__.corruptDropCountsForTest()["ask-claim"] ?? 0;
+    const errors: string[] = [];
+    const orig = console.error;
+    console.error = (...a: any[]) => void errors.push(a.join(" "));
+    try {
+      assert.equal(testApi.deliverPendingQuestion(carrier, pi), false);
+      assert.equal(testApi.deliverPendingQuestion(carrier, pi), false);
+    } finally {
+      console.error = orig;
+    }
+    assert.equal(__pollForExitTest__.corruptDropCountsForTest()["ask-claim"], before + 1);
+    assert.ok(errors.some((e) => e.includes("torn-json-second-failure")));
+  });
+});
+
+describe("L7 artifact sweep", () => {
+  it("session_start removes stale claims + old staged files, keeps the rest", async () => {
+    const subagents = await import("../pi-extension/subagents/index.ts");
+    const { getArtifactDir } = await import("../pi-extension/subagents/paths.ts");
+    const { utimesSync: uts, mkdirSync: mds } = await import("node:fs");
+    const dir = mkdtempSync(join(tmpdir(), "l7-"));
+    const sid = "sessL7";
+    const art = getArtifactDir(dir, sid);
+    const scripts = join(art, "subagent-scripts");
+    mds(scripts, { recursive: true });
+    const oldStaged = join(scripts, "old.sh");
+    const freshStaged = join(scripts, "fresh.sh");
+    writeFileSync(oldStaged, "x");
+    writeFileSync(freshStaged, "x");
+    const eightDaysAgo = new Date(Date.now() - 8 * 24 * 3600 * 1000);
+    uts(oldStaged, eightDaysAgo, eightDaysAgo);
+    const staleClaim = join(art, "s.jsonl.ask.consuming-123-abc");
+    writeFileSync(staleClaim, "x");
+    const tenMinAgo = new Date(Date.now() - 10 * 60 * 1000);
+    uts(staleClaim, tenMinAgo, tenMinAgo);
+    const registryFile = join(art, "subagent-registry.json");
+    writeFileSync(registryFile, JSON.stringify({}));
+    const handlers: Record<string, Function[]> = {};
+    const api = {
+      on: (e: string, h: Function) => void ((handlers[e] ??= []).push(h)),
+      registerTool: () => {},
+      registerCommand: () => {},
+      registerMessageRenderer: () => {},
+      sendMessage: () => {},
+      sendUserMessage: () => {},
+      getAllTools: () => [],
+    } as any;
+    (subagents as any).default(api);
+    const ctx = mockSessionCtx(dir, sid);
+    try {
+      handlers["session_start"][0](undefined, ctx);
+      assert.equal(existsSync(oldStaged), false, "old staged file swept");
+      assert.equal(existsSync(freshStaged), true, "fresh staged file kept");
+      assert.equal(existsSync(staleClaim), false, "stale claim swept");
+      assert.equal(existsSync(registryFile), true, "registry untouched");
+    } finally {
+      try { handlers["session_shutdown"][0](undefined, ctx); } catch {}
     }
   });
 });

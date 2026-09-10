@@ -49,7 +49,8 @@ instead of a silent fake completion.
 `subagent_message({ name, message })` does three different things based on state — same name, no need to know which:
 
 - **Running** → the message is typed into the subagent's tab only (never your input) and picked up at its next turn.
-  Returns an immediate ack; the eventual result still arrives as a notification.
+  Returns an immediate ack; the eventual result still arrives as a notification. Keep steers human-scale (a paragraph
+  or two) — multi-KB pastes risk terminal line-wrap mangling; put long content in a file and point at the path.
 - **Kept open** (first result delivered, tab still alive) → steered into the live tab, same as running. Only a
   *relaunch* is refused while the tab lives — close it and retry for that.
 - **Finished** → resumes the session (see step 4 above).
@@ -57,6 +58,10 @@ instead of a silent fake completion.
 A subagent can also ask *you* something first via its `ask_question` tool. Its session parks as `waiting`, you get a
 notification with the question, and your `subagent_message` reply becomes its next turn. It never exits while a
 question is unanswered.
+
+Humans should only drive **kept** tabs (see `EXIT-KEEP-PRECEDENCE.md`): an auto-exit tab shuts itself down when its
+turn ends even if you are typing in it — typing does not hold the tab open. Kept tabs stay interactive after their
+first result and are safe to work in directly.
 
 ## The widget
 
@@ -84,7 +89,7 @@ Spawning is permissioned: every spawn must name a known agent, and a subagent ma
 - `pi-extension/subagents/notifications.ts` — the sole owner of parent-bound steer messages (`subagent_result` / `subagent_question` / `subagent_status`).
 - `pi-extension/subagents/widget.ts` + `format.ts` — widget rendering and elapsed/token/context formatters. `keep.ts` holds the keep/exit truth table; `names.ts`/`paths.ts` hold slug/path helpers; `config.ts` reads `config.json` fresh (refreshed on `session_start`).
 - `pi-extension/subagents/kitty.ts` — the only terminal-dependent layer: open tab, send text, read screen, close tab, detect exit. Everything else is terminal-agnostic.
-- `pi-extension/subagents/session/` (via the `session.ts` barrel) — session files (`io`), session-id index (`index-cache`), name registry (`registry`), sandbox snapshots (`loadout`), seeding (`seed`), stats (`stats`); retired branch helpers are quarantined in `legacy-branch.ts`.
+- `pi-extension/subagents/session/` (via the `session.ts` barrel) — session files (`io`), session-id index (`index-cache`, quarantined: newest-wins prefix matching, do not build on it), name registry (`registry`), sandbox snapshots (`loadout`), seeding (`seed` — headers hand-track pi's session format, `version: 3`; re-check against the installed pi on upgrades), stats (`stats`); retired branch helpers are quarantined in `legacy-branch.ts`.
 - `pi-extension/subagents/activity.ts` + `status.ts` + `status-bridge.ts` — child liveness reporting, its classification, and the bridge between them.
 - `pi-extension/subagents/subagent-done.ts` (+ pure helpers in `subagent-done-pure.ts`) — loaded *inside* each subagent: auto-exit on completion, error reporting, the `ask_question` tool.
 - Agent profiles — resolved in three tiers (bundled package dir, global `~/.pi/agent/agents/`, project `.pi/agents/`; later tiers override). Put yours wherever fits your setup.
@@ -94,5 +99,5 @@ Spawning is permissioned: every spawn must name a known agent, and a subagent ma
 Almost all coordination is **files + notifications**, not terminal tricks:
 
 - **Terminal** (kitty remote control, always over the socket): open tab, type into a tab, read a tab's screen for the exit sentinel, close a tab.
-- **Files**: session transcripts (results; torn lines are skipped, never fatal), `.exit` sidecar (failures; claimed atomically), `.ask` file (questions; written atomically, claimed via rename so concurrent watchers deliver exactly once), activity file (liveness), registry + sandbox snapshot (resume).
+- **Files**: session transcripts (results; torn lines are skipped, never fatal), `.exit` sidecar (failures; claimed atomically), `.ask` file (questions; written atomically, claimed via rename so concurrent watchers deliver exactly once), activity file (liveness), registry + sandbox snapshot (resume). Reserved filename suffixes (the parent↔child protocol — never reuse them): `.exit`, `.done`, `.ask`, `.loadout.json`, `.transcript` (Claude only), `.consuming-*` (transient rename-claims, swept when stale), `.pending-*` (parked questions), `.tmp-*` (transient writer temps), `.corrupt-retry` (torn-`.ask` retry marker), `.corrupt-<ts>` (registry backups, kept as evidence). `session_start` sweeps stale claims and week-old staged artifacts; the registry itself is never swept.
 - **Notifications** (extension → you, as new turns): `subagent_result` (finished), `subagent_question` (it asked something), `subagent_status` (stalled/recovered).

@@ -38,7 +38,7 @@ Work queue for agents. **Read this file first** — it's the single source of tr
 
 ### Phase 3 — Bug lows + compat + hygiene bundle
 
-- [ ] `2026-09-09-bug-lows-hygiene.md` — L1–L8, downgraded M10/M11, async steer/close, GC, compat pins; H2/S10-deletions/P5/S13-generalization explicitly out (links: `bug-findings.md` L§§/Compat, `bug-findings-review.md` L§§/Severity/Missing #2–4)
+- [x] `2026-09-09-bug-lows-hygiene.md` — L1–L8, downgraded M10/M11, async steer/close, GC, compat pins; H2/S10-deletions/P5/S13-generalization explicitly out — done, summary: `2026-09-09-bug-lows-hygiene_summary.md` (bugfixes 57/57; full suite 269/273, 4 pre-existing discovery failures only)
 
 ### Phase 4 — Refactor foundation (wrappers, constants, renderers)
 

@@ -739,9 +739,11 @@ describe("status.ts", () => {
       () => parseStatusConfig({ status: { enabled: "false" } }),
       /status\.enabled must be a boolean/,
     );
-    assert.throws(
-      () => parseStatusConfig({ status: { enabled: true, defaultCadenceSeconds: 60 } }),
-      /status has unsupported key\(s\): defaultCadenceSeconds/,
+    // Compat-5: unknown keys warn-and-ignore (forward compat), wrong types
+    // still throw. The warning goes to console.warn; assert the parse.
+    assert.deepEqual(
+      parseStatusConfig({ status: { enabled: true, defaultCadenceSeconds: 60 } }),
+      { enabled: true, lineLimit: 4 },
     );
   });
 
@@ -1113,12 +1115,13 @@ describe("tabs config", () => {
       /tabs\.keepOpen must be a boolean/,
     );
     assert.throws(
-      () => parseExtensionConfig({ status: { enabled: true }, tabs: { keep_open: true } }),
-      /tabs has unsupported key\(s\): keep_open/,
-    );
-    assert.throws(
       () => parseExtensionConfig({ status: { enabled: true }, tabs: null }),
       /tabs must be an object/,
+    );
+    // Compat-5: unknown keys warn-and-ignore (forward compat).
+    assert.deepEqual(
+      parseExtensionConfig({ status: { enabled: true }, tabs: { keep_open: true } }).tabs,
+      { keepOpen: false },
     );
   });
 
@@ -2567,7 +2570,7 @@ describe("subagent interruption", () => {
     }
   });
 
-  it("steers a running subagent by typing into its pane (newlines flattened)", () => {
+  it("steers a running subagent by typing into its pane (newlines flattened)", async () => {
     const testApi = (subagentsModule as any).__test__;
     let sentSurface = "";
     let sentText = "";
@@ -2594,7 +2597,7 @@ describe("subagent interruption", () => {
     assert.match(result.error, /Failed to deliver message/);
   });
 
-  it("delivers a steer message and forces local status waiting", () => {
+  it("delivers a steer message and forces local status waiting", async () => {
     const testApi = (subagentsModule as any).__test__;
     const runningMap = testApi.runningSubagents as Map<string, any>;
     let sentSurface = "";
@@ -2619,7 +2622,7 @@ describe("subagent interruption", () => {
     try {
       runningMap.set("a1", makeRunning({ statusState: activeState }));
 
-      const result = withMockedNow(20_000, () =>
+      const result = await withMockedNow(20_000, () =>
         testApi.handleSubagentSteer({ name: "Worker", message: "keep going" }, (surface: string, text: string) => {
           sentSurface = surface;
           sentText = text;
@@ -2638,20 +2641,20 @@ describe("subagent interruption", () => {
     }
   });
 
-  it("requires a message when steering", () => {
+  it("requires a message when steering", async () => {
     const testApi = (subagentsModule as any).__test__;
     const runningMap = testApi.runningSubagents as Map<string, any>;
     runningMap.clear();
     try {
       runningMap.set("a1", makeRunning());
-      const result = testApi.handleSubagentSteer({ name: "Worker", message: "  " }, () => {});
+      const result = await testApi.handleSubagentSteer({ name: "Worker", message: "  " }, () => {});
       assert.match(result.content[0].text, /`message` is required/);
     } finally {
       runningMap.clear();
     }
   });
 
-  it("leaves status unchanged when steering delivery fails in the tool path", () => {
+  it("leaves status unchanged when steering delivery fails in the tool path", async () => {
     const testApi = (subagentsModule as any).__test__;
     const runningMap = testApi.runningSubagents as Map<string, any>;
     runningMap.clear();
@@ -2674,7 +2677,7 @@ describe("subagent interruption", () => {
     try {
       runningMap.set("a1", makeRunning({ statusState: activeState }));
 
-      const result = withMockedNow(20_000, () =>
+      const result = await withMockedNow(20_000, () =>
         testApi.handleSubagentSteer({ name: "Worker", message: "go" }, () => {
           throw new Error("mux write failed");
         }),

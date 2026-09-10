@@ -2,6 +2,13 @@
  * Name registry: persistent name → session mapping per spawner session.
  * File format (`subagent-registry.json`) is a compat boundary across pi
  * restarts — do not change the shape.
+ *
+ * Compat-2: the file carries a top-level `version` (currently 1) alongside
+ * the name → entry map. Readers tolerate its absence (pre-version writers)
+ * and ignore unknown top-level keys; writers carry the `version` marker over
+ * across read-modify-write so a newer schema tag survives an older writer.
+ * (Unknown non-entry keys are NOT carried — M6 drops malformed entries for
+ * good. New marker keys must be allowlisted in `splitRegistryFile`.)
  */
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -29,6 +36,34 @@ export interface NameRegistryEntry {
 
 export type NameRegistry = Record<string, NameRegistryEntry>;
 
+/** Schema version written by current writers (compat-2). */
+export const NAME_REGISTRY_VERSION = 1;
+
+/** Top-level registry file shape: version marker + name entries. */
+interface NameRegistryFile {
+  version?: unknown;
+  [name: string]: unknown;
+}
+
+/** Split a parsed registry file into carried-over top-level keys + entries. */
+function splitRegistryFile(parsed: Record<string, unknown>): {
+  entries: NameRegistry;
+  carried: Record<string, unknown>;
+} {
+  const entries: NameRegistry = {};
+  const carried: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(parsed)) {
+    if (value && typeof (value as NameRegistryEntry).sessionFile === "string") {
+      entries[key] = value as NameRegistryEntry;
+    } else if (key === "version") {
+      carried[key] = value;
+    }
+    // Anything else shaped wrong is dropped for good (M6) — see the
+    // compat-2 note on the module docblock before allowlisting new keys.
+  }
+  return { entries, carried };
+}
+
 /** Path of the name registry for a given spawner session's artifact dir. */
 export function nameRegistryPath(artifactDir: string): string {
   return join(artifactDir, "subagent-registry.json");
@@ -41,7 +76,9 @@ export function readNameRegistry(artifactDir: string): NameRegistry {
     if (!existsSync(p)) return {};
     const parsed = JSON.parse(readFileSync(p, "utf8"));
     if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return {};
-    return parsed as NameRegistry;
+    // Compat-2: `version` and any other top-level marker keys are skipped
+    // here (they are not name entries); writers carry them over.
+    return splitRegistryFile(parsed as Record<string, unknown>).entries;
   } catch (err) {
     // Absent file returns {} silently above; only corrupt/unreadable logs.
     warnRegistryErrorOnce("read", err);
@@ -75,13 +112,7 @@ function parseRegistryBytes(raw: string): NameRegistry | null {
     return null;
   }
   if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
-  const out: NameRegistry = {};
-  for (const [key, value] of Object.entries(parsed as Record<string, unknown>)) {
-    if (value && typeof (value as NameRegistryEntry).sessionFile === "string") {
-      out[key] = value as NameRegistryEntry;
-    }
-  }
-  return out;
+  return splitRegistryFile(parsed as Record<string, unknown>).entries;
 }
 
 /**
@@ -102,14 +133,24 @@ export function registerName(
     mkdirSync(artifactDir, { recursive: true });
     const p = nameRegistryPath(artifactDir);
     let registry: NameRegistry;
+    // Compat-2: the `version` marker survives an older writer via
+    // read-modify-write carry-over.
+    let carried: Record<string, unknown> = {};
     try {
       if (!existsSync(p)) {
         registry = {};
       } else {
         const raw = readFileSync(p, "utf8");
-        const parsed = parseRegistryBytes(raw);
-        if (parsed) {
-          registry = parsed;
+        let parsed: unknown = null;
+        try {
+          parsed = JSON.parse(raw);
+        } catch {
+          parsed = null;
+        }
+        if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+          const split = splitRegistryFile(parsed as Record<string, unknown>);
+          registry = split.entries;
+          carried = split.carried;
         } else {
           // Corrupt: preserve the bytes before overwriting.
           try {
@@ -118,15 +159,18 @@ export function registerName(
           } catch {}
           warnRegistryErrorOnce("write", new Error("backed up corrupt registry, starting fresh"));
           registry = {};
+          carried = {};
         }
       }
     } catch (err) {
       warnRegistryErrorOnce("write", err);
       registry = {};
+      carried = {};
     }
     registry[name] = entry;
+    const fileOut: NameRegistryFile = { version: NAME_REGISTRY_VERSION, ...carried, ...registry };
     const tmp = `${p}.tmp-${process.pid}-${Math.random().toString(16).slice(2, 8)}`;
-    writeFileSync(tmp, JSON.stringify(registry, null, 2), "utf8");
+    writeFileSync(tmp, JSON.stringify(fileOut, null, 2), "utf8");
     renameSync(tmp, p);
   } catch (err) {
     // Best-effort only; never breaks the spawn itself.

@@ -27,7 +27,7 @@ through one helper that always passes `--to`. See `HOW-IT-WORKS.md` requirements
   
 **Why:** title matches are regexes, non-unique, and child-controlled (prompt escape sequences can rewrite titles) — an injection and misdelivery vector. And the no-match default (active window) is exactly "type into the main session's input", the thing we must never do. Numeric ids are exact and unforgeable from inside the child.
 
-**What we do:** `matchFor()` guards all five addressed commands (send-text, send-key, get-text, close-window, focus-window). `PI_SUBAGENT_SURFACE` is write-only, so the handle representation is an internal detail.
+**What we do:** `matchFor()` guards all five addressed commands (send-text, send-key, get-text, close-window, focus-window). `PI_SUBAGENT_SURFACE` is write-only, so the handle representation is an internal detail. Persisted handles (registry `surface` strings, possibly written by an older version) are re-validated through `matchFor` at *every* use — never cache a pre-built `--match` string, and never add a non-numeric surface handle that bypasses this gate.
 
 ## 4. Send payloads via `--stdin`, submit with `send-key enter`
 

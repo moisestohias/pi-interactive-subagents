@@ -3,6 +3,19 @@
  * every .jsonl and reads each header (measured ~67s on a 2010-file tree on
  * the extension host's single thread). This builds once per root and
  * validates cheaply (dir listing + stat-only mtime checks) thereafter.
+ *
+ * QUARANTINED (L5) — do not build new callers on this module. Known traps
+ * for the next reader:
+ * - `getSessionIndex` calls `indexDir` on EVERY branch (including the
+ *   signature-unchanged fast path), so every lookup still walks the whole
+ *   tree with sync `readdir`+`stat`. The top-level signature never
+ *   short-circuits; treat every call as a full walk.
+ * - `lookupSessionIndex` prefix-matches and silently returns the newest
+ *   mtime on collision (newest-wins, ambiguity swallowed). Callers needing
+ *   exact resolution must check for collisions themselves.
+ * Either adopt it properly (early-out on unchanged signature + surface
+ * ambiguity instead of newest-wins) or leave it alone. Production callers:
+ * none (barrel re-export + tests only).
  */
 import { closeSync, existsSync, openSync, readSync, readdirSync, statSync } from "node:fs";
 import { join } from "node:path";

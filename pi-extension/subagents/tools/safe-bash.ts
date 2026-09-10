@@ -29,6 +29,11 @@ const DANGEROUS_PATTERNS = [
 	/:\(\)\s*\{\s*:\|:&\s*\}\s*;:/,
 	/>\s*\/dev\/[sh]d[a-z]/,
 	/\bchmod\s+(-[a-zA-Z]+\s+)?777\s+\//,
+	// L1 dispositions (pinned, intentional overblocks — the wrapper favors
+	// false positives on footguns over misses; narrow only with a test):
+	// `chmod 777 /tmp/x` matches the pattern above even though /tmp is
+	// world-writable by design; read-only `dd if=…` matches `dd\s+if=`
+	// below even for pure reads. Both stay blocked.
 	/\bchown\s+(-[a-zA-Z]+\s+)?root/,
 	/\bcurl\s.*\|\s*(ba)?sh/,
 	/\bwget\s.*\|\s*(ba)?sh/,
@@ -52,11 +57,17 @@ const BLOCKED_IN_SUBSTITUTION = [
 function hasBlockedSubstitution(command: string): boolean {
 	const stripped = command.replace(/\\\n/g, " ");
 	// $() , ``, ${} — crude nesting-agnostic scan: check each expansion body.
+	// L1: `${…}` bodies are scanned too (`${sudo}`, `${IFS}` tricks) — the
+	// old comment claimed this while the code only collected $() and
+	// backticks. Still best-effort: nested/braced expansions can dodge a
+	// regex scan, so this stays a guardrail, not a sandbox.
 	const bodies: string[] = [];
 	const dollarParen = stripped.match(/\$\(([^)]*)\)/g) ?? [];
 	for (const m of dollarParen) bodies.push(m);
 	const backtick = stripped.match(/`([^`]*)`/g) ?? [];
 	for (const m of backtick) bodies.push(m);
+	const dollarBrace = stripped.match(/\$\{([^}]*)\}/g) ?? [];
+	for (const m of dollarBrace) bodies.push(m);
 	for (const body of bodies) {
 		for (const pattern of BLOCKED_IN_SUBSTITUTION) {
 			if (pattern.test(body)) return true;

@@ -115,9 +115,16 @@ function rejectUnsupportedKeys(
   source: string,
   fieldName: string,
 ): void {
+  // Compat-5: unknown keys warn-and-ignore (forward compat — a config
+  // written by a newer version must not hard-fail an older extension).
+  // Wrong *types* on known keys still throw via the require* validators.
   const unsupportedKeys = Object.keys(value).filter((key) => !allowedKeys.includes(key));
   if (unsupportedKeys.length > 0) {
-    invalidStatusConfig(source, `${fieldName} has unsupported key(s): ${unsupportedKeys.join(", ")}`);
+    try {
+      console.warn(
+        `[subagents] ${source}: ${fieldName} has unsupported key(s) (ignored): ${unsupportedKeys.join(", ")}`,
+      );
+    } catch {}
   }
 }
 

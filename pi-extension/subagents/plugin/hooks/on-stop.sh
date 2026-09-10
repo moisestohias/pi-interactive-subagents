@@ -15,10 +15,13 @@ input=$(cat)
 # node, so it is always present where this hook matters), empty on failure.
 json_field() {
   local query="$1" data="$2" result=""
+  # L2: non-string values are serialized (json.dumps / JSON.stringify), not
+  # degraded to a python repr / [object Object] — the sentinel feeds the
+  # parent-side summary verbatim, so it must stay valid JSON/text.
   if command -v python3 >/dev/null 2>&1; then
-    result=$(printf '%s' "$data" | python3 -c "import sys,json; print(json.load(sys.stdin).get('$query', ''))" 2>/dev/null || true)
+    result=$(printf '%s' "$data" | python3 -c "import sys,json; v=json.load(sys.stdin).get('$query',''); print(v if isinstance(v,str) else (json.dumps(v) if v is not None else ''))" 2>/dev/null || true)
   elif command -v node >/dev/null 2>&1; then
-    result=$(printf '%s' "$data" | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{try{const o=JSON.parse(d);console.log(o['$query']??'')}catch{}})" 2>/dev/null || true)
+    result=$(printf '%s' "$data" | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{try{const o=JSON.parse(d);const v=o['$query'];console.log(typeof v==='string'?v:(v==null?'':JSON.stringify(v)))}catch{}})" 2>/dev/null || true)
   fi
   printf '%s' "$result"
 }
