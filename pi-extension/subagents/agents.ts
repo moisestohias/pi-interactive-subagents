@@ -160,10 +160,39 @@ export function escapeRegExp(s: string): string {
   return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
+/**
+ * Parse a frontmatter block once into a key→value map (S7). Values are
+ * single-line `key: value` pairs; the fence regex in `parseAgentDefinition`
+ * already isolates the block, so this is a line scan (no per-key RegExp).
+ * Duplicate keys are pathological (the old regex returned the first match);
+ * last-wins here is equally safe. Values keep their trimmed text, including
+ * "" — the `getFrontmatterValue` wrapper below maps "" back to undefined
+ * to preserve the old `(.+)` contract.
+ */
+export function parseFrontmatterBlock(block: string): Map<string, string> {
+  const out = new Map<string, string>();
+  for (const rawLine of block.split("\n")) {
+    const line = rawLine.replace(/\r$/, "");
+    const colon = line.indexOf(":");
+    if (colon <= 0) continue;
+    const key = line.slice(0, colon).trim();
+    if (!key || /\s/.test(key)) continue;
+    out.set(key, line.slice(colon + 1).trim());
+  }
+  return out;
+}
+
+/**
+ * Thin wrapper over `parseFrontmatterBlock` (kept for test compat).
+ * Returns undefined for missing keys AND empty values (matches the old
+ * regex, which required `(.+)` after the colon).
+ */
 export function getFrontmatterValue(frontmatter: string, key: string): string | undefined {
-  // N12: escape the key (all live callers use constants, but this is exported).
-  const match = frontmatter.match(new RegExp(`^${escapeRegExp(key)}:\\s*(.+)$`, "m"));
-  return match ? match[1].trim() : undefined;
+  // N12: keys are constants at all live callers, but this is exported —
+  // the map lookup needs no escaping at all (one more reason for the map).
+  void escapeRegExp;
+  const value = parseFrontmatterBlock(frontmatter).get(key);
+  return value != null && value !== "" ? value : undefined;
 }
 
 export function parseOptionalBoolean(value: string | undefined): boolean | undefined {
@@ -215,26 +244,32 @@ export function parseAgentDefinition(
 
   const frontmatter = match[1];
   const body = content.replace(/^---\r?\n[\s\S]*?\r?\n---[ \t]*(?:\r?\n|$)/, "").trim();
-  const systemPromptMode = getFrontmatterValue(frontmatter, "system-prompt");
+  // S7: parse the block once into a Map (O(1) per key, no per-key RegExp).
+  const fm = parseFrontmatterBlock(frontmatter);
+  const get = (key: string): string | undefined => {
+    const value = fm.get(key);
+    return value != null && value !== "" ? value : undefined;
+  };
+  const systemPromptMode = get("system-prompt");
 
   return {
-    name: getFrontmatterValue(frontmatter, "name") ?? fallbackName,
-    description: getFrontmatterValue(frontmatter, "description"),
-    model: getFrontmatterValue(frontmatter, "model"),
-    tools: getFrontmatterValue(frontmatter, "tools"),
+    name: get("name") ?? fallbackName,
+    description: get("description"),
+    model: get("model"),
+    tools: get("tools"),
     systemPromptMode:
       systemPromptMode === "replace" ? "replace" : systemPromptMode === "append" ? "append" : undefined,
-    skills: getFrontmatterValue(frontmatter, "skill") ?? getFrontmatterValue(frontmatter, "skills"),
-    thinking: getFrontmatterValue(frontmatter, "thinking"),
-    subagentAgents: parseSubagentAgents(getFrontmatterValue(frontmatter, "subagent_agents")),
-    autoExit: parseOptionalBoolean(getFrontmatterValue(frontmatter, "auto-exit")),
-    interactive: parseOptionalBoolean(getFrontmatterValue(frontmatter, "interactive")),
-    sessionMode: parseSessionMode(getFrontmatterValue(frontmatter, "session-mode")),
-    cwd: getFrontmatterValue(frontmatter, "cwd"),
-    cli: getFrontmatterValue(frontmatter, "cli"),
+    skills: get("skill") ?? get("skills"),
+    thinking: get("thinking"),
+    subagentAgents: parseSubagentAgents(get("subagent_agents")),
+    autoExit: parseOptionalBoolean(get("auto-exit")),
+    interactive: parseOptionalBoolean(get("interactive")),
+    sessionMode: parseSessionMode(get("session-mode")),
+    cwd: get("cwd"),
+    cli: get("cli"),
     body: body || undefined,
     disableModelInvocation:
-      getFrontmatterValue(frontmatter, "disable-model-invocation")?.toLowerCase() === "true",
+      get("disable-model-invocation")?.toLowerCase() === "true",
   };
 }
 
@@ -291,13 +326,49 @@ export function getDefaultSessionDirFor(cwd: string, agentDir: string): string {
   return sessionDir;
 }
 
+/** Single launch-policy decision table (S8): everything the spawner derives from an agent definition. */
+export interface LaunchPolicy {
+  sessionMode: SubagentSessionMode;
+  seededSessionMode: "lineage-only" | "fork" | null;
+  inheritsConversationContext: boolean;
+  taskDelivery: "direct" | "artifact";
+  interactive: boolean;
+}
+
+/**
+ * Resolve the full launch policy from an agent definition in one table:
+ * `sessionMode` (frontmatter `session-mode`, default `standalone`) drives
+ * the seed/task-delivery arms; `interactive` is explicit frontmatter else
+ * the inverse of `auto-exit`. Call sites take one call instead of three.
+ */
+export function resolveLaunchPolicy(agentDefs: AgentDefaults | null): LaunchPolicy {
+  const sessionMode = agentDefs?.sessionMode ?? "standalone";
+  const inheritsConversationContext = sessionMode === "fork";
+  return {
+    sessionMode,
+    seededSessionMode: sessionMode === "standalone" ? null : sessionMode,
+    inheritsConversationContext,
+    taskDelivery: inheritsConversationContext ? "direct" : "artifact",
+    interactive:
+      agentDefs?.interactive != null ? agentDefs.interactive : !(agentDefs?.autoExit ?? false),
+  };
+}
+
+/**
+ * @deprecated Use `resolveLaunchPolicy(agentDefs).sessionMode`. Kept for
+ * `__test__` compat (`test/test.ts` pins this key — D7).
+ */
 export function resolveEffectiveSessionMode(
   _params: unknown,
   agentDefs: AgentDefaults | null,
 ): SubagentSessionMode {
-  return agentDefs?.sessionMode ?? "standalone";
+  return resolveLaunchPolicy(agentDefs).sessionMode;
 }
 
+/**
+ * @deprecated Use `resolveLaunchPolicy(agentDefs)` (minus `interactive`).
+ * Kept for `__test__` compat (`test/test.ts` pins this key — D7).
+ */
 export function resolveLaunchBehavior(
   params: unknown,
   agentDefs: AgentDefaults | null,
@@ -307,26 +378,23 @@ export function resolveLaunchBehavior(
   inheritsConversationContext: boolean;
   taskDelivery: "direct" | "artifact";
 } {
-  const sessionMode = resolveEffectiveSessionMode(params, agentDefs);
-  const inheritsConversationContext = sessionMode === "fork";
-  return {
-    sessionMode,
-    seededSessionMode: sessionMode === "standalone" ? null : sessionMode,
-    inheritsConversationContext,
-    taskDelivery: inheritsConversationContext ? "direct" : "artifact",
-  };
+  void params;
+  const { sessionMode, seededSessionMode, inheritsConversationContext, taskDelivery } =
+    resolveLaunchPolicy(agentDefs);
+  return { sessionMode, seededSessionMode, inheritsConversationContext, taskDelivery };
 }
 
 /**
  * Decide whether a subagent is interactive (user-driven, long-running).
  * Resolution: explicit `interactive` frontmatter, else inverse of `auto-exit`.
+ * @deprecated Use `resolveLaunchPolicy(agentDefs).interactive`. Kept for
+ * `__test__` compat (`test/test.ts` pins this key — D7).
  */
 export function resolveEffectiveInteractive(
   _params: unknown,
   agentDefs: AgentDefaults | null,
 ): boolean {
-  if (agentDefs?.interactive != null) return agentDefs.interactive;
-  return !(agentDefs?.autoExit ?? false);
+  return resolveLaunchPolicy(agentDefs).interactive;
 }
 
 export function loadAgentDefaults(agentName: string): AgentDefaults | null {

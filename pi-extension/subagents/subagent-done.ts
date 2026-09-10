@@ -28,6 +28,7 @@ import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { Box, Text } from "@mariozechner/pi-tui";
 import { Type } from "@sinclair/typebox";
 import { renameSync, writeFileSync } from "node:fs";
+import { atomicWriteJson } from "./session/sidecars.ts";
 import { createSubagentActivityRecorder } from "./activity.ts";
 import {
   shouldMarkUserTookOver as shouldMarkUserTookOverFn,
@@ -48,15 +49,13 @@ export type { SubagentErrorInfo } from "./subagent-done-pure.ts";
 
 /**
  * Atomic JSON sidecar write (C3/H3): tmp file + rename so parent polls never
- * observe a partway-flushed payload. The parent's rename-claim would
- * otherwise grab a truncated file, fail JSON.parse, and delete a real
- * signal as "corrupt" while the child's remaining bytes go to the renamed
- * inode (lost). Used for `.ask`, `.exit`, and `.done` alike.
+ * observe a partway-flushed payload. Single home: `session/sidecars.ts` (T8)
+ * — this wrapper only preserves the historical name for the child call sites
+ * below. Exported `writeAskSignalAtomic` / `writeCompletionSidecarAtomic`
+ * remain as thin aliases (task contract; tests import them).
  */
 function writeSidecarJsonAtomic(target: string, data: unknown): void {
-  const tmp = `${target}.tmp-${process.pid}-${Math.random().toString(16).slice(2, 8)}`;
-  writeFileSync(tmp, JSON.stringify(data), "utf8");
-  renameSync(tmp, target);
+  atomicWriteJson(target, data);
 }
 
 /**

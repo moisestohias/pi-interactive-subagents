@@ -21,6 +21,7 @@ import { promisify } from "node:util";
 import { existsSync, readFileSync, renameSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import { takeSidecar } from "./session/sidecars.ts";
 
 const execFileAsync = promisify(execFile);
 
@@ -440,20 +441,10 @@ export function corruptDropCountsForTest(): Record<string, number> {
  * Claim a sidecar file via rename-before-read. Returns the claim path, or
  * null when absent / already claimed by another consumer (race lost).
  * Shared by `.exit` and `.done` so both deliver exactly once (M1).
+ * Single home: `session/sidecars.ts:claimFile` (T8).
  */
 function claimSidecarFile(path: string): string | null {
-  try {
-    if (!existsSync(path)) return null;
-    const claim = `${path}.consuming-${process.pid}-${Math.random().toString(16).slice(2, 8)}`;
-    try {
-      renameSync(path, claim);
-    } catch {
-      return null; // another consumer claimed it
-    }
-    return claim;
-  } catch {
-    return null;
-  }
+  return claimFile(path);
 }
 
 /**
@@ -462,51 +453,13 @@ function claimSidecarFile(path: string): string | null {
  * config `tabs.keepOpen=true` + agent `auto-exit:false`, session left open).
  * Returns null when neither exists. Files are claimed via rename and deleted
  * on read so each signal fires once, even with concurrent consumers (M1).
+ * Single home: `session/sidecars.ts:takeSidecar` (T8) — this wrapper only
+ * injects the corrupt-drop observer (Missing #4). N5 + M9 policies live there.
  */
 function takeCompletionSidecar(sessionFile: string, opts?: { ignoreDone?: boolean }): PollResult | null {
-  // N5: claim via rename BEFORE parse so a corrupt `.exit` can never poison
-  // the poll loop forever (previously a JSON.parse throw skipped rmSync and
-  // the same file was retried every tick).
-  try {
-    const exitFile = `${sessionFile}.exit`;
-    if (existsSync(exitFile)) {
-      const claim = claimSidecarFile(exitFile);
-      if (!claim) return null; // another consumer claimed it
-      try {
-        const data = JSON.parse(readFileSync(claim, "utf-8"));
-        rmSync(claim, { force: true });
-        return interpretExitSidecar(data);
-      } catch {
-        try {
-          rmSync(claim, { force: true });
-        } catch {}
-        // Corrupt sidecar consumed (not retried): fall through to `.done`.
-        // Missing #4: never silent — a torn `.exit` is exactly the signal
-        // loss H3 was about, so it gets logged + counted.
-        logCorruptDrop("exit-sidecar", exitFile, "torn-json-consumed");
-      }
-    }
-  } catch {}
-  try {
-    const doneFile = `${sessionFile}.done`;
-    // M9: kept-tab monitors pass `ignoreDone` — after the first result the
-    // session stays interactive, so a second `.done` (e.g. after a child-side
-    // `/reload` resets `completionSignaled`) must not end supervision while
-    // the tab is still alive. Later `.ask`s keep relaying via the tick.
-    if (opts?.ignoreDone) return null;
-    if (existsSync(doneFile)) {
-      // M1: rename-claim like `.exit` (previously existsSync+rmSync, so two
-      // concurrent consumers could both deliver). Presence alone is the
-      // signal — no parse, so a valid `.done` is never dropped as "corrupt".
-      const claim = claimSidecarFile(doneFile);
-      if (!claim) return null; // another consumer claimed it
-      try {
-        rmSync(claim, { force: true });
-      } catch {}
-      return { reason: "done", exitCode: 0 };
-    }
-  } catch {}
-  return null;
+  const taken = takeSidecar(sessionFile, { ...opts, onCorrupt: logCorruptDrop });
+  if (!taken) return null;
+  return { reason: taken.reason, exitCode: taken.exitCode, ...(taken.errorMessage ? { errorMessage: taken.errorMessage } : {}) };
 }
 
 export const __pollForExitTest__ = { interpretExitSidecar, takeCompletionSidecar, corruptDropCountsForTest };

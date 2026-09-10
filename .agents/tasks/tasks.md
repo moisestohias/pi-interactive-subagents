@@ -50,7 +50,7 @@ Work queue for agents. **Read this file first** — it's the single source of tr
 
 ### Phase 6 — Refactor handlers + lifecycle + lazy tail + docs
 
-- [ ] `2026-09-09-refactor-handlers-lifecycle.md` — T5 validators then executes, P1 lifecycle.ts, P2 runtime-tail, sidecars.ts, S6/S7/S8 with aliases, AGENTS.md sync; P5/S10-deletions/S13-generalization explicitly not scheduled (links: `refactor-suggestions.md` T5/T7/T8/P1/P2, `refactor-suggestions-review.md` D3–D5/D7/M2/M3/M5)
+- [x] `2026-09-09-refactor-handlers-lifecycle.md` — T5 validators then executes, P1 lifecycle.ts, P2 runtime-tail, sidecars.ts, S6/S7/S8 with aliases, AGENTS.md sync; P5/S10-deletions/S13-generalization explicitly not scheduled — done, summary: `2026-09-09-refactor-handlers-lifecycle_summary.md` (index 2681→317; handlers/ + lifecycle + runtime + sidecars; 15 new tests; full suite 293/297, 4 pre-existing discovery failures only; integration fails identically on baseline — environmental)
 
 
 ## Done

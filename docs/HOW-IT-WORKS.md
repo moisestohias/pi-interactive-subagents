@@ -82,7 +82,10 @@ Spawning is permissioned: every spawn must name a known agent, and a subagent ma
 
 ## How the pieces fit (files)
 
-- `pi-extension/subagents/index.ts` — thin orchestrator wiring: tool/command/renderer registration plus `session_start`/`session_shutdown` handling. The logic lives in the modules below; it runs in your session.
+- `pi-extension/subagents/index.ts` — thin extension wiring: tool/command/renderer registration plus `session_start`/`session_shutdown` delegation. The logic lives in the modules below; it runs in your session.
+- `pi-extension/subagents/handlers/` — tool executes: `spawn.ts` (`subagent`), `message.ts` (`subagent_message`, steer-vs-resume dispatch), `list.ts` (`subagents_list` + `/subagent` command), plus pure gates in `validators.ts`.
+- `pi-extension/subagents/lifecycle.ts` — run/kept/watch orchestration: launch + watch, reload recovery, per-session teardown, artifact sweep, the `.ask` queue, per-session UI.
+- `pi-extension/subagents/runtime.ts` — process-global keys + import-time rotation (survive `/reload` by design).
 - `pi-extension/subagents/agents.ts` — agent profiles: frontmatter parsing, discovery (bundled package dir → global `~/.pi/agent/agents/` → project `.pi/agents/`), spawn gating, tool→extension mapping.
 - `pi-extension/subagents/launch.ts` + `cli/claude.ts` — command builders: sandbox flags, env prefixes, task artifacts, launch scripts (pi and Claude paths).
 - `pi-extension/subagents/store.ts` — live identity: running runs, kept tabs, parallel-spawn reservations (single owner).

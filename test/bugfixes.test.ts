@@ -829,17 +829,23 @@ describe("compat pins", () => {
   it("Symbol.for / global keys are literal-pinned", async () => {
     const root = new URL("../pi-extension/subagents/", import.meta.url);
     const indexSrc = readFileSync(new URL("index.ts", root), "utf8");
+    const runtimeSrc = readFileSync(new URL("runtime.ts", root), "utf8");
+    const lifecycleSrc = readFileSync(new URL("lifecycle.ts", root), "utf8");
     const agentsSrc = readFileSync(new URL("agents.ts", root), "utf8");
     const donePureSrc = readFileSync(new URL("subagent-done-pure.ts", root), "utf8");
+    // P2: the interval/poll keys are canonically owned by runtime.ts (thin
+    // index.ts only re-exports behavior); the literals stay pinned here.
     for (const key of [
       "pi-subagents/widget-interval",
       "pi-subagents/status-interval",
       "pi-subagents/poll-abort-controller",
     ]) {
-      assert.ok(indexSrc.includes(`"${key}"`), key);
+      assert.ok(runtimeSrc.includes(`"${key}"`), key);
     }
     assert.ok(
-      indexSrc.includes('"pi-subagents/running-children-count"') &&
+      (runtimeSrc.includes('"pi-subagents/running-children-count"') ||
+        lifecycleSrc.includes('"pi-subagents/running-children-count"') ||
+        indexSrc.includes('"pi-subagents/running-children-count"')) &&
         donePureSrc.includes('"pi-subagents/running-children-count"'),
       "children count (writer + reader agree on the literal)",
     );

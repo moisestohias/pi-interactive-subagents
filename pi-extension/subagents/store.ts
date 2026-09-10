@@ -15,14 +15,58 @@ import {
   type NameRegistry,
 } from "./session.ts";
 import { windowExistsOrNull } from "./kitty.ts";
+import type { SubagentStatusState } from "./status.ts";
+import type { SubagentActivityState } from "./activity.ts";
 
 export interface RunningEntry {
   id: string;
   name: string;
   sessionFile: string;
   surface: string;
+  /** Human task text (launch params / resume message). */
+  task?: string;
+  /** Agent profile name, when spawned with one. */
+  agent?: string;
+  /** Run start (ms epoch). */
+  startTime?: number;
+  /** Stable artifact script path of the launch/resume command. */
+  launchScriptFile?: string;
+  /** Per-run liveness file. */
+  activityFile?: string;
+  /** Latest observed activity snapshot. */
+  activity?: SubagentActivityState;
+  /** Last activity-file read outcome (observability for stall labels). */
+  activityRead?: {
+    ok: boolean;
+    reason?: "missing" | "invalid" | "wrong-id";
+    error?: string;
+  };
+  /** Watcher abort (the tool's own signal completes on return). */
+  abortController?: AbortController;
+  /** Spawner session artifact dir owning this run (M1 shutdown scoping). */
+  parentArtifactDir?: string;
+  /** CLI backend (`"claude"` or unset for pi). */
+  cli?: string;
+  /** Claude sentinel file (claude path only). */
+  sentinelFile?: string;
+  /** Per-run keep decision: keepOpen && !autoExit. */
+  keepSurface?: boolean;
+  /** Effective auto-exit sent via PI_SUBAGENT_AUTO_EXIT (!keepSurface). */
+  autoExit?: boolean;
+  /** Status-machine state for stall/recovery supervision. */
+  statusState?: SubagentStatusState;
+  /** User-driven long runs skip stall/recovery steers (widget still updates). */
+  interactive?: boolean;
   [key: string]: unknown;
 }
+
+/**
+ * Canonical live-run shape (M2). The old index-local `RunningSubagent`
+ * interface was a duplicate of `RunningEntry` plus casts at every boundary —
+ * they are now one interface; `RunningSubagent` stays as an alias so
+ * existing imports keep compiling.
+ */
+export type RunningSubagent = RunningEntry;
 
 export interface KeptTab {
   name: string;

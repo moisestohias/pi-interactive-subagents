@@ -13,9 +13,10 @@ import { shellEscape } from "./kitty.ts";
 import { getSubagentsDir } from "./paths.ts";
 import { slugifyName, contextArtifactName, launchScriptName, resumeScriptName } from "./names.ts";
 import { timestampTag } from "./format.ts";
-import { getToolExtensionPath, type SubagentLoadoutShim } from "./launch-types.ts";
-import { SPAWNING_TOOLS } from "./agents.ts";
+import { getToolExtensionPath } from "./agents.ts";
 import type { SubagentLoadout } from "./session.ts";
+/** @deprecated Removed shim (S6): `launch-types.ts` deleted — import `agents.ts` directly. Kept as a type alias so older imports keep compiling. */
+export type SubagentLoadoutShim = unknown;
 
 // ── Small pure helpers ──────────────────────────────────────────────────────
 
@@ -402,5 +403,4 @@ export function buildPiResumePlan(opts: {
   return { command, scriptFile, resumeMsgFile, parts, envPrefix, cdPrefix };
 }
 
-// Re-export type shim helper for tests that stub tool paths.
-export type { SubagentLoadoutShim };
+import { SPAWNING_TOOLS } from "./agents.ts";
