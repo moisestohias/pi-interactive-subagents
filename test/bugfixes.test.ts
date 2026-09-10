@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, writeFileSync, existsSync } from "node:fs";
+import { mkdtempSync, writeFileSync, existsSync, renameSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
@@ -162,13 +162,18 @@ describe("C3/M4 atomic ask consume", () => {
     assert.equal(existsSync(`${sessionFile}.ask`), false);
   });
 
-  it("drops corrupt claims without looping forever", () => {
+  it("retains torn claims once, then drops (mixed-version gate)", () => {
+    // Compat-1: a corrupt claim is retained once for retry (it may be a
+    // torn write from a pre-C3 child) and dropped on the second consecutive
+    // failure, so a genuinely corrupt file can never loop forever.
     const dir = mkdtempSync(join(tmpdir(), "ask-bad-"));
     const sessionFile = join(dir, "s.jsonl");
     writeFileSync(sessionFile, JSON.stringify({ type: "session", id: "s" }) + "\n");
     writeFileSync(`${sessionFile}.ask`, "{corrupt");
     const pi = { sendMessage: () => { throw new Error("must not send"); } } as any;
     const carrier = { name: "w", sessionFile, startTime: Date.now() };
+    assert.equal(testApi.deliverPendingQuestion(carrier, pi), false);
+    assert.equal(existsSync(`${sessionFile}.ask`), true);
     assert.equal(testApi.deliverPendingQuestion(carrier, pi), false);
     assert.equal(existsSync(`${sessionFile}.ask`), false);
   });
@@ -308,5 +313,355 @@ describe("M1 done-claim delivers once", () => {
     assert.deepEqual(first, { reason: "done", exitCode: 0 });
     assert.equal(second, null);
     assert.equal(existsSync(`${sessionFile}.done`), false);
+  });
+});
+
+describe("M4 absent status section", () => {
+  it("tabs-only config loads with status defaults", () => {
+    assert.deepEqual(parseStatusConfig({ tabs: { keepOpen: true } }, "test"), {
+      enabled: true,
+      lineLimit: 4,
+    });
+  });
+
+  it("parseExtensionConfig accepts tabs-only configs", async () => {
+    const { parseExtensionConfig } = await import("../pi-extension/subagents/status.ts");
+    assert.deepEqual(parseExtensionConfig({ tabs: { keepOpen: true } }), {
+      status: { enabled: true, lineLimit: 4 },
+      tabs: { keepOpen: true },
+    });
+  });
+
+  it("present-but-invalid status still throws (loud)", () => {
+    assert.throws(() => parseStatusConfig({ status: { enabled: "yes" } }, "test"));
+    assert.throws(() => parseStatusConfig({ status: null }, "test"));
+  });
+
+  it("getSafeExtensionConfig matches strict config when valid, never throws", async () => {
+    const cfg = await import("../pi-extension/subagents/config.ts");
+    const safe = cfg.getSafeExtensionConfig();
+    assert.equal(typeof safe.status.enabled, "boolean");
+    assert.ok(Number.isInteger(safe.status.lineLimit) && safe.status.lineLimit > 0);
+    assert.deepEqual(safe, cfg.getExtensionConfig());
+  });
+});
+
+describe("M5 loadout validation", () => {
+  const valid = {
+    agent: "worker",
+    toolAllowlist: "read",
+    model: null,
+    thinking: null,
+    systemPromptMode: null,
+    identity: null,
+    spawnable: null,
+    autoExit: true,
+    cwd: null,
+    agentDir: null,
+  };
+
+  it("accepts the full valid shape", async () => {
+    const { isValidSubagentLoadout } = await import("../pi-extension/subagents/session/loadout.ts");
+    assert.equal(isValidSubagentLoadout(valid), true);
+  });
+
+  it("rejects null/empty/missing allowlists and wrong shapes", async () => {
+    const { isValidSubagentLoadout } = await import("../pi-extension/subagents/session/loadout.ts");
+    assert.equal(isValidSubagentLoadout({ ...valid, toolAllowlist: null }), false);
+    assert.equal(isValidSubagentLoadout({ ...valid, toolAllowlist: "  " }), false);
+    assert.equal(isValidSubagentLoadout({ ...valid, toolAllowlist: 42 }), false);
+    assert.equal(isValidSubagentLoadout({ ...valid, autoExit: "yes" }), false);
+    assert.equal(isValidSubagentLoadout({ ...valid, systemPromptMode: "overwrite" }), false);
+    assert.equal(isValidSubagentLoadout({ ...valid, spawnable: "scout" }), false);
+    assert.equal(isValidSubagentLoadout(null), false);
+    assert.equal(isValidSubagentLoadout([]), false);
+  });
+
+  it("readSubagentLoadout refuses a nulled allowlist (never unrestricted)", async () => {
+    const { readSubagentLoadout, loadoutSidecarPath } =
+      await import("../pi-extension/subagents/session/loadout.ts");
+    const { writeFileSync: wfs } = await import("node:fs");
+    const dir = mkdtempSync(join(tmpdir(), "m5-"));
+    const sf = join(dir, "s.jsonl");
+    wfs(sf, JSON.stringify({ type: "session", id: "s" }) + "\n");
+    wfs(loadoutSidecarPath(sf), JSON.stringify({ ...valid, toolAllowlist: null }));
+    assert.equal(readSubagentLoadout(sf), null);
+  });
+});
+
+describe("M6 registry backup", () => {
+  it("backs up corrupt registries instead of clobbering", async () => {
+    const { registerName, readNameRegistry, nameRegistryPath } =
+      await import("../pi-extension/subagents/session/registry.ts");
+    const { readdirSync: rds, readFileSync: rfs } = await import("node:fs");
+    const dir = mkdtempSync(join(tmpdir(), "m6-"));
+    registerName(dir, "a", { sessionFile: "/a.jsonl", sessionId: "1" });
+    writeFileSync(nameRegistryPath(dir), "{torn");
+    registerName(dir, "b", { sessionFile: "/b.jsonl", sessionId: "2" });
+    assert.equal(readNameRegistry(dir).b?.sessionId, "2");
+    const backups = rds(dir).filter((f) => f.startsWith("subagent-registry.json.corrupt-"));
+    assert.equal(backups.length, 1);
+    assert.equal(rfs(join(dir, backups[0]), "utf8"), "{torn");
+  });
+
+  it("merges salvageable entries from partially-valid registries", async () => {
+    const { registerName, readNameRegistry, nameRegistryPath } =
+      await import("../pi-extension/subagents/session/registry.ts");
+    const dir = mkdtempSync(join(tmpdir(), "m6-salvage-"));
+    writeFileSync(
+      nameRegistryPath(dir),
+      JSON.stringify({ good: { sessionFile: "/g.jsonl", sessionId: "g" }, bad: { sessionId: 42 } }),
+    );
+    registerName(dir, "new", { sessionFile: "/n.jsonl", sessionId: "n" });
+    const reg = readNameRegistry(dir);
+    assert.equal(reg.good?.sessionId, "g");
+    assert.equal(reg.new?.sessionId, "n");
+    assert.equal("bad" in reg, false);
+  });
+});
+
+describe("M8 tool registry survives reload", () => {
+  it("backing map lives on a Symbol.for global", async () => {
+    const agents = await import("../pi-extension/subagents/agents.ts");
+    agents.__clearToolExtensionsForTest();
+    try {
+      agents.registerToolExtension("m8_tool", "/ext/path.ts");
+      assert.equal(agents.getToolExtensionPath("m8_tool"), "/ext/path.ts");
+      // A /reload re-import resets module-locals; the Symbol.for map persists.
+      const backing = (globalThis as any)[Symbol.for("pi-subagents/tool-extensions")];
+      assert.ok(backing instanceof Map);
+      assert.equal(backing.get("m8_tool"), "/ext/path.ts");
+    } finally {
+      agents.__clearToolExtensionsForTest();
+    }
+    assert.equal(agents.getToolExtensionPath("m8_tool"), undefined);
+  });
+});
+
+describe("M2 no-clobber claim restore", () => {
+  it("queues the held payload and drains it after the newer question", async () => {
+    const { renameSync, readFileSync: rfs } = await import("node:fs");
+    const dir = mkdtempSync(join(tmpdir(), "m2-"));
+    const sessionFile = join(dir, "s.jsonl");
+    writeFileSync(sessionFile, JSON.stringify({ type: "session", id: "s" }) + "\n");
+    const askFile = `${sessionFile}.ask`;
+    writeFileSync(askFile, JSON.stringify({ name: "w", question: "Q1" }));
+    // Simulate the race: Q1 claimed, then the child asks Q2.
+    const claim = `${askFile}.testclaim`;
+    renameSync(askFile, claim);
+    writeFileSync(askFile, JSON.stringify({ name: "w", question: "Q2" }));
+    assert.equal(testApi.restoreAskClaimNoClobber(claim, askFile), "kept-newer");
+    assert.equal(JSON.parse(rfs(askFile, "utf8")).question, "Q2");
+    // Q2 delivers first; the parked Q1 drains on the next tick.
+    const seen: string[] = [];
+    const pi = { sendMessage: (m: any) => void seen.push(m.content) } as any;
+    const carrier = { name: "w", agent: "worker", sessionFile, startTime: Date.now() - 1000 };
+    assert.equal(testApi.deliverPendingQuestion(carrier, pi), true);
+    assert.match(seen[0], /Q2/);
+    assert.equal(testApi.deliverPendingQuestion(carrier, pi), true);
+    assert.match(seen[1], /Q1/);
+    assert.equal(existsSync(askFile), false);
+  });
+});
+
+describe("M3 cancelled-notify gate", () => {
+  it("cancelled results never notify; real errors always do", () => {
+    assert.equal(testApi.shouldNotifyResult({ error: "cancelled" }), false);
+    assert.equal(testApi.shouldNotifyResult({} as any), true);
+    assert.equal(testApi.shouldNotifyResult({ error: "boom" } as any), true);
+  });
+});
+
+describe("M7 resume baseline on parsed-entry basis", () => {
+  it("torn lines before the resume point don't shift the window", async () => {
+    const { readEntriesAfter, getNewEntries } =
+      await import("../pi-extension/subagents/session/io.ts");
+    const sid = JSON.stringify({ type: "session", id: "s" });
+    const m1 = JSON.stringify({ type: "message", id: "m1", message: { role: "assistant", content: [{ type: "text", text: "one" }] } });
+    const m2 = JSON.stringify({ type: "message", id: "m2", message: { role: "assistant", content: [{ type: "text", text: "two" }] } });
+    const m3 = JSON.stringify({ type: "message", id: "m3", message: { role: "assistant", content: [{ type: "text", text: "three" }] } });
+    const f = sessionFileWithRaw([sid, m1, "{torn line", m2].join("\n") + "\n");
+    // Parsed-length basis (what the resume path now stores).
+    const base = readEntriesAfter(f, 0);
+    const baseline = base.total - (base.skipped ?? 0);
+    assert.equal(baseline, 3);
+    const { appendFileSync } = await import("node:fs");
+    appendFileSync(f, m3 + "\n");
+    assert.deepEqual(
+      getNewEntries(f, baseline).map((e: any) => e.id),
+      ["m3"],
+    );
+    // The old raw-line-count basis overshoots by the torn count and misses m3.
+    assert.deepEqual(getNewEntries(f, base.total).map((e: any) => e.id), []);
+  });
+});
+
+describe("M9 kept monitor ignores second .done", () => {
+  it("takeCompletionSidecar with ignoreDone leaves .done alone", async () => {
+    const { __pollForExitTest__ } = await import("../pi-extension/subagents/kitty.ts");
+    const dir = mkdtempSync(join(tmpdir(), "m9-"));
+    const sf = join(dir, "s.jsonl");
+    writeFileSync(sf, JSON.stringify({ type: "session", id: "s" }) + "\n");
+    writeFileSync(`${sf}.done`, JSON.stringify({ type: "done" }), "utf8");
+    assert.equal(__pollForExitTest__.takeCompletionSidecar(sf, { ignoreDone: true }), null);
+    assert.equal(existsSync(`${sf}.done`), true);
+    assert.deepEqual(__pollForExitTest__.takeCompletionSidecar(sf), { reason: "done", exitCode: 0 });
+  });
+
+  it("still reports .exit errors with ignoreDone set", async () => {
+    const { __pollForExitTest__ } = await import("../pi-extension/subagents/kitty.ts");
+    const dir = mkdtempSync(join(tmpdir(), "m9-exit-"));
+    const sf = join(dir, "s.jsonl");
+    writeFileSync(sf, JSON.stringify({ type: "session", id: "s" }) + "\n");
+    writeFileSync(`${sf}.done`, JSON.stringify({ type: "done" }), "utf8");
+    writeFileSync(`${sf}.exit`, JSON.stringify({ type: "error", errorMessage: "late failure" }), "utf8");
+    const result = __pollForExitTest__.takeCompletionSidecar(sf, { ignoreDone: true });
+    assert.equal(result?.reason, "error");
+    assert.equal(result?.errorMessage, "late failure");
+  });
+});
+
+// ── H4/H5 lifecycle harnesses ────────────────────────────────────────────────
+
+function mockExtensionApi() {
+  const handlers: Record<string, Function[]> = {};
+  return {
+    api: {
+      on: (e: string, h: Function) => void ((handlers[e] ??= []).push(h)),
+      registerTool: () => {},
+      registerCommand: () => {},
+      registerMessageRenderer: () => {},
+      sendMessage: () => {},
+      sendUserMessage: () => {},
+      getAllTools: () => [],
+    } as any,
+    handlers,
+  };
+}
+
+function mockSessionCtx(dir: string, sid: string, calls: string[] = []) {
+  return {
+    hasUI: true,
+    ui: { setWidget: (...a: any[]) => void calls.push(a[0]), notify: () => {} },
+    sessionManager: {
+      getSessionDir: () => dir,
+      getSessionId: () => sid,
+      getSessionFile: () => join(dir, "parent.jsonl"),
+    },
+  } as any;
+}
+
+describe("H4 per-session timers", () => {
+  it("shutdown of one session keeps the survivor's timers; last shutdown clears", async () => {
+    const subagents = await import("../pi-extension/subagents/index.ts");
+    const { getArtifactDir } = await import("../pi-extension/subagents/paths.ts");
+    const { createStatusState } = await import("../pi-extension/subagents/status.ts");
+    const dirA = mkdtempSync(join(tmpdir(), "h4-a-"));
+    const dirB = mkdtempSync(join(tmpdir(), "h4-b-"));
+    const artA = getArtifactDir(dirA, "sessA");
+    const artB = getArtifactDir(dirB, "sessB");
+    const { api: apiA, handlers: hA } = mockExtensionApi();
+    const { api: apiB, handlers: hB } = mockExtensionApi();
+    (subagents as any).default(apiA);
+    (subagents as any).default(apiB);
+    const running = testApi.runningSubagents as Map<string, any>;
+    const ctxs = testApi.sessionCtxs as Map<string, any>;
+    const startA = hA["session_start"][0];
+    const shutA = hA["session_shutdown"][0];
+    const shutB = hB["session_shutdown"][0];
+    const now = Date.now();
+    try {
+      startA(undefined, mockSessionCtx(dirA, "sessA"));
+      hB["session_start"][0](undefined, mockSessionCtx(dirB, "sessB"));
+      assert.ok(ctxs.has(artA) && ctxs.has(artB));
+      running.set("h4-run", {
+        id: "h4-run",
+        name: "H4",
+        task: "t",
+        surface: "1",
+        startTime: now,
+        sessionFile: join(dirA, "s.jsonl"),
+        parentArtifactDir: artA,
+        abortController: new AbortController(),
+        cli: "claude",
+        statusState: createStatusState({ source: "claude", startTimeMs: now }),
+      });
+      testApi.startWidgetRefresh();
+      testApi.startStatusRefresh({ sendMessage: () => {} });
+      assert.deepEqual(testApi.timersActiveForTest(), { widget: true, status: true });
+      shutB(undefined, mockSessionCtx(dirB, "sessB"));
+      assert.ok(running.has("h4-run"), "survivor run untouched");
+      assert.ok(!ctxs.has(artB) && ctxs.has(artA), "only the shutting session forgotten");
+      assert.deepEqual(testApi.timersActiveForTest(), { widget: true, status: true });
+      shutA(undefined, mockSessionCtx(dirA, "sessA"));
+      assert.ok(!running.has("h4-run"), "own runs torn down");
+      assert.deepEqual(testApi.timersActiveForTest(), { widget: false, status: false });
+    } finally {
+      running.delete("h4-run");
+      try { shutA(undefined, mockSessionCtx(dirA, "sessA")); } catch {}
+      try { shutB(undefined, mockSessionCtx(dirB, "sessB")); } catch {}
+    }
+  });
+});
+
+describe("H5 reload resurrection", () => {
+  it("decides watch/prune/skip from tracked/kept/liveness (tri-state)", () => {
+    const decide = testApi.decideResurrectAction;
+    assert.equal(decide({ tracked: true, kept: false, alive: true }), "skip");
+    assert.equal(decide({ tracked: false, kept: true, alive: true }), "skip");
+    assert.equal(decide({ tracked: false, kept: false, alive: false }), "prune");
+    // Unknown control plane watches rather than orphaning (N3).
+    assert.equal(decide({ tracked: false, kept: false, alive: null }), "watch");
+    assert.equal(decide({ tracked: false, kept: false, alive: true }), "watch");
+  });
+
+  it("session_start settles orphans: watches live tabs, prunes dead surfaces", async () => {
+    // Environment-adaptive: without kitty remote control, liveness is
+    // unknown so the orphan is re-watched (assert registration + clean
+    // abort); with a live control plane, surface 99999 is positively dead
+    // so the dead surface is pruned for resume-by-name (assert registry).
+    // Both are correct H5 behavior — a live tab must never end ownerless.
+    const subagents = await import("../pi-extension/subagents/index.ts");
+    const { getArtifactDir } = await import("../pi-extension/subagents/paths.ts");
+    const { registerName, readNameRegistry } =
+      await import("../pi-extension/subagents/session/registry.ts");
+    const dir = mkdtempSync(join(tmpdir(), "h5-"));
+    const sid = "sessH5";
+    const art = getArtifactDir(dir, sid);
+    const sessionFile = join(dir, "child.jsonl");
+    writeFileSync(sessionFile, JSON.stringify({ type: "session", id: "c1" }) + "\n");
+    const { api, handlers } = mockExtensionApi();
+    (subagents as any).default(api);
+    registerName(art, "Orphan", { sessionFile, sessionId: "c1", surface: "99999", running: true });
+    const running = testApi.runningSubagents as Map<string, any>;
+    const start = handlers["session_start"][0];
+    const shut = handlers["session_shutdown"][0];
+    const ctx = mockSessionCtx(dir, sid);
+    try {
+      start(undefined, ctx);
+      await new Promise((r) => setTimeout(r, 25));
+      const entry = [...running.values()].find((r: any) => r.name === "Orphan");
+      if (entry) {
+        // Watch path (liveness unknown): live tab re-watched.
+        assert.equal(entry.surface, "99999");
+        entry.abortController.abort();
+        await new Promise((r) => setTimeout(r, 75));
+        assert.ok(
+          ![...running.values()].some((r: any) => r.name === "Orphan"),
+          "aborted watcher cleans up without notifying",
+        );
+      } else {
+        // Prune path (positively dead): surface cleared for resume-by-name.
+        const reg = readNameRegistry(art)["Orphan"] as any;
+        assert.ok(reg, "registry handle preserved");
+        assert.equal(reg.surface, undefined);
+        assert.equal(reg.sessionFile, sessionFile);
+      }
+    } finally {
+      for (const [id, r] of [...running]) {
+        if ((r as any).name === "Orphan") running.delete(id);
+      }
+      try { shut(undefined, ctx); } catch {}
+    }
   });
 });

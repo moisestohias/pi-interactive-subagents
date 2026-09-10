@@ -41,14 +41,41 @@ export function writeSubagentLoadout(sessionFile: string, loadout: SubagentLoado
   }
 }
 
-/** Read a subagent's loadout snapshot, or null if absent/unparseable. */
+/**
+ * Validate a parsed loadout snapshot (M5). The resume path replays this
+ * snapshot as a sandbox (`--no-extensions --tools …`); an unchecked cast
+ * lets a hand-crafted / legacy / child-rewritten sidecar null out the
+ * allowlist and relaunch with the parent's full toolset. `toolAllowlist`
+ * must be a non-empty string — anything else refuses resume (the caller
+ * surfaces the existing loadout-refusal instead of escalating).
+ */
+export function isValidSubagentLoadout(value: unknown): value is SubagentLoadout {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const v = value as Record<string, unknown>;
+  const strOrNull = (k: string): boolean => v[k] === null || typeof v[k] === "string";
+  if (!(v.agent === null || typeof v.agent === "string")) return false;
+  if (typeof v.toolAllowlist !== "string" || v.toolAllowlist.trim() === "") return false;
+  if (!strOrNull("model")) return false;
+  if (!strOrNull("thinking")) return false;
+  if (!(v.systemPromptMode === null || v.systemPromptMode === "append" || v.systemPromptMode === "replace"))
+    return false;
+  if (!strOrNull("identity")) return false;
+  if (!(v.spawnable === null || (Array.isArray(v.spawnable) && v.spawnable.every((s) => typeof s === "string"))))
+    return false;
+  if (typeof v.autoExit !== "boolean") return false;
+  if (!strOrNull("cwd")) return false;
+  if (!strOrNull("agentDir")) return false;
+  return true;
+}
+
+/** Read a subagent's loadout snapshot, or null if absent/unparseable/invalid. */
 export function readSubagentLoadout(sessionFile: string): SubagentLoadout | null {
   try {
     const p = loadoutSidecarPath(sessionFile);
     if (!existsSync(p)) return null;
     const parsed = JSON.parse(readFileSync(p, "utf8"));
-    if (!parsed || typeof parsed !== "object") return null;
-    return parsed as SubagentLoadout;
+    if (!isValidSubagentLoadout(parsed)) return null;
+    return parsed;
   } catch {
     return null;
   }

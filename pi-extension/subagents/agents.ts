@@ -81,7 +81,22 @@ export function getAgentConfigDir(): string {
 }
 
 // ── Runtime tool-extension registration ─────────────────────────────────────
-const EXTRA_TOOL_EXTENSIONS = new Map<string, string>();
+// M8: the map itself lives on a `Symbol.for` global (like the other
+// reload-surviving state) so registrations persist across `/reload`
+// re-imports. Previously only the `registerToolExtension` function pointer
+// was published while the module-local `Map` reset to empty — the tool's
+// `-e` path then silently stopped resolving and children launched with a
+// narrower toolset.
+const TOOL_EXTENSIONS_KEY = Symbol.for("pi-subagents/tool-extensions");
+
+function extraToolExtensions(): Map<string, string> {
+  let map = (globalThis as any)[TOOL_EXTENSIONS_KEY];
+  if (!(map instanceof Map)) {
+    map = new Map<string, string>();
+    (globalThis as any)[TOOL_EXTENSIONS_KEY] = map;
+  }
+  return map;
+}
 
 /** Register (or re-register) a custom tool's backing extension file. */
 export function registerToolExtension(name: string, extensionPath: string): void {
@@ -91,19 +106,19 @@ export function registerToolExtension(name: string, extensionPath: string): void
   if ((SPAWNING_TOOLS as readonly string[]).includes(name)) {
     throw new Error(`Cannot register custom tool "${name}": shadows a spawning tool`);
   }
-  const existing = EXTRA_TOOL_EXTENSIONS.get(name);
+  const existing = extraToolExtensions().get(name);
   if (existing === extensionPath) return; // idempotent / reload-safe
   if (existing !== undefined) {
     throw new Error(
       `Tool extension already registered for "${name}": ${existing} (refusing to overwrite with ${extensionPath})`,
     );
   }
-  EXTRA_TOOL_EXTENSIONS.set(name, extensionPath);
+  extraToolExtensions().set(name, extensionPath);
 }
 
 /** Test hook: clear runtime-registered tool extensions. */
 export function __clearToolExtensionsForTest(): void {
-  EXTRA_TOOL_EXTENSIONS.clear();
+  extraToolExtensions().clear();
 }
 
 // Expose registration on a process-global so project-local extensions loaded
@@ -126,7 +141,7 @@ export function getToolExtensionPath(tool: string): string | undefined {
   const map = getToolExtensionMap(getSubagentsDir(), getAgentConfigDir());
   const builtin = map[tool];
   if (builtin && existsSync(builtin)) return builtin;
-  return EXTRA_TOOL_EXTENSIONS.get(tool);
+  return extraToolExtensions().get(tool);
 }
 
 /** Read PI_SUBAGENT_ALLOWED fresh (not frozen at import) — see config.ts. */

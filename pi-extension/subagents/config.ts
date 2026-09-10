@@ -7,9 +7,16 @@
  * format but reads fresh per call (one small JSON read) with a lightweight
  * cache invalidated on session_start.
  */
-import { loadExtensionConfig, type ExtensionConfig, type StatusConfig, type TabsConfig } from "./status.ts";
+import { loadExtensionConfig, DEFAULT_STATUS_LINE_LIMIT, type ExtensionConfig, type StatusConfig, type TabsConfig } from "./status.ts";
 
 let cached: ExtensionConfig | null = null;
+
+function defaultExtensionConfig(): ExtensionConfig {
+  return {
+    status: { enabled: true, lineLimit: DEFAULT_STATUS_LINE_LIMIT },
+    tabs: { keepOpen: false },
+  };
+}
 
 export function getExtensionConfig(forceReload = false): ExtensionConfig {
   if (cached && !forceReload) return cached;
@@ -21,12 +28,34 @@ export function getExtensionConfig(forceReload = false): ExtensionConfig {
     // discarding the user's entire status+tabs config.
     const msg = err instanceof Error ? err.message : String(err);
     if (msg.startsWith("Missing subagent status config")) {
-      cached = { status: { enabled: true, lineLimit: 4 }, tabs: { keepOpen: false } };
+      cached = defaultExtensionConfig();
     } else {
       throw err;
     }
   }
   return cached;
+}
+
+/**
+ * Non-throwing config read for render + timer paths (M4). Tool paths keep
+ * using `getExtensionConfig()` (loud on schema errors, per rule 5), but the
+ * widget render callback and the 1s status timer must degrade to last-good
+ * (or defaults) instead of throwing per frame/tick on a bad file.
+ */
+let lastGood: ExtensionConfig | null = null;
+
+export function getSafeExtensionConfig(): ExtensionConfig {
+  try {
+    lastGood = getExtensionConfig();
+    return lastGood;
+  } catch (err) {
+    try {
+      console.error(
+        `[subagents] invalid config, degrading to last-good until fixed: ${(err as Error)?.message ?? err}`,
+      );
+    } catch {}
+    return lastGood ?? defaultExtensionConfig();
+  }
 }
 
 export function invalidateExtensionConfigCache(): void {

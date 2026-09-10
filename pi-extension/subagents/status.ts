@@ -145,8 +145,17 @@ function activityLabel(snapshot: Pick<StatusSnapshot, "activityLabel" | "activeS
   return snapshot.activityLabel ?? snapshot.activeScope;
 }
 
+export const DEFAULT_STATUS_CONFIG: StatusConfig = {
+  enabled: true,
+  lineLimit: DEFAULT_STATUS_LINE_LIMIT,
+};
+
 export function parseStatusConfig(rawConfig: unknown, source = "config.json"): StatusConfig {
   const config = requireObject(rawConfig, source, "root");
+  // M4: absent `status` means defaults (mirrors parseTabsConfig) — a
+  // tabs-only config must not break the whole TUI. Present-but-invalid
+  // still throws (loud, per rule 5).
+  if (config.status === undefined) return { ...DEFAULT_STATUS_CONFIG };
   const status = requireObject(config.status, source, "status");
   rejectUnsupportedKeys(status, ["enabled", "lineLimit"], source, "status");
   const enabled = requireBoolean(status.enabled, source, "status.enabled");

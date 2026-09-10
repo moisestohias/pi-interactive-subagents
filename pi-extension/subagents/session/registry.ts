@@ -14,8 +14,17 @@ export interface NameRegistryEntry {
   /**
    * Kitty window id of the tab left open by a keep-tab run, if any.
    * Lets resume refuse to double-open a session that is still alive.
+   * Since H5, also persisted for *running* runs at launch (with `running`)
+   * so `session_start` can re-watch live tabs orphaned by `/reload`.
    */
   surface?: string;
+  /**
+   * True while the run that owns `surface` is still watched (set at launch,
+   * cleared when the completion handler re-registers). Lets recovery tell a
+   * live run (re-watch it) from a kept tab (re-attach its monitor). Absent
+   * (older writers) with `surface` means kept — the previous behavior.
+   */
+  running?: boolean;
 }
 
 export type NameRegistry = Record<string, NameRegistryEntry>;
@@ -55,8 +64,34 @@ function warnRegistryErrorOnce(where: string, err: unknown): void {
 }
 
 /**
+ * Parse registry bytes, salvaging entries with a valid shape (M6). Returns
+ * null when nothing is usable (unparseable, or a non-object like `[]`).
+ */
+function parseRegistryBytes(raw: string): NameRegistry | null {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return null;
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
+  const out: NameRegistry = {};
+  for (const [key, value] of Object.entries(parsed as Record<string, unknown>)) {
+    if (value && typeof (value as NameRegistryEntry).sessionFile === "string") {
+      out[key] = value as NameRegistryEntry;
+    }
+  }
+  return out;
+}
+
+/**
  * Register (or overwrite) a name → session mapping. Atomic (temp + rename)
  * so concurrent readers never see a partial registry.
+ *
+ * M6: a corrupt registry is backed up (`subagent-registry.json.corrupt-<ts>`)
+ * instead of silently clobbered — one torn write/disk-full/manual edit plus
+ * the next spawn used to discard every prior handle permanently. Salvageable
+ * entries are merged, never dropped.
  */
 export function registerName(
   artifactDir: string,
@@ -65,9 +100,31 @@ export function registerName(
 ): void {
   try {
     mkdirSync(artifactDir, { recursive: true });
-    const registry = readNameRegistry(artifactDir);
-    registry[name] = entry;
     const p = nameRegistryPath(artifactDir);
+    let registry: NameRegistry;
+    try {
+      if (!existsSync(p)) {
+        registry = {};
+      } else {
+        const raw = readFileSync(p, "utf8");
+        const parsed = parseRegistryBytes(raw);
+        if (parsed) {
+          registry = parsed;
+        } else {
+          // Corrupt: preserve the bytes before overwriting.
+          try {
+            const backup = `${p}.corrupt-${new Date().toISOString().replace(/[:.]/g, "-")}`;
+            writeFileSync(backup, raw, "utf8");
+          } catch {}
+          warnRegistryErrorOnce("write", new Error("backed up corrupt registry, starting fresh"));
+          registry = {};
+        }
+      }
+    } catch (err) {
+      warnRegistryErrorOnce("write", err);
+      registry = {};
+    }
+    registry[name] = entry;
     const tmp = `${p}.tmp-${process.pid}-${Math.random().toString(16).slice(2, 8)}`;
     writeFileSync(tmp, JSON.stringify(registry, null, 2), "utf8");
     renameSync(tmp, p);

@@ -34,7 +34,7 @@ Work queue for agents. **Read this file first** — it's the single source of tr
 
 ### Phase 2 — Bug mediums + session lifecycle
 
-- [ ] `2026-09-09-bug-mediums-lifecycle.md` — M4/M5/M6/M8 trust boundaries, M2/M3/M7/M9 watcher robustness, H4/H5 per-session timers + reload resurrection (links: `bug-findings.md` M2–M9/H4/H5, `bug-findings-review.md` #5–9)
+- [x] `2026-09-09-bug-mediums-lifecycle.md` — M4/M5/M6/M8 trust boundaries, M2/M3/M7/M9 watcher robustness, H4/H5 per-session timers + reload resurrection (links: `bug-findings.md` M2–M9/H4/H5, `bug-findings-review.md` #5–9) — done, summary: `2026-09-09-bug-mediums-lifecycle_summary.md` (bugfixes 42/42; full suite 254/258, 4 pre-existing discovery failures only)
 
 ### Phase 3 — Bug lows + compat + hygiene bundle
 

@@ -2,7 +2,7 @@ import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-age
 import { keyHint } from "@mariozechner/pi-coding-agent";
 import { Type, type Static } from "@sinclair/typebox";
 import { Box, Text, truncateToWidth, visibleWidth } from "@mariozechner/pi-tui";
-import { dirname, join, resolve } from "node:path";
+import { dirname, join, resolve, basename } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   readdirSync,
@@ -71,7 +71,7 @@ import {
   resolveResultPresentation as resolveResultPresentationCanonical,
   keptTabSuffix as keptTabSuffixCanonical,
 } from "./notifications.ts";
-import { getExtensionConfig, invalidateExtensionConfigCache } from "./config.ts";
+import { getExtensionConfig, getSafeExtensionConfig, invalidateExtensionConfigCache } from "./config.ts";
 import {
   buildClaudeCommand as buildClaudeCommandCanonical,
   copyClaudeSession as copyClaudeSessionCanonical,
@@ -94,10 +94,10 @@ import {
 } from "./notifications.ts";
 
 import {
-  countSessionEntryLines,
   findLastAssistantMessage,
   getNewEntries,
   getSessionId,
+  readEntriesAfter,
   readNameRegistry,
   readSubagentLoadout,
   registerName,
@@ -514,6 +514,17 @@ interface SubagentResult {
 }
 
 /**
+ * Pure gate for completion fan-out (M3): cancelled runs (the watcher was
+ * aborted on session shutdown/reload) must not steer a "Subagent
+ * cancelled." notification into a dead session, and a throwing
+ * `sendMessage` during teardown must never escape as an unhandled
+ * rejection. Exported via `__test__` for unit tests.
+ */
+function shouldNotifyResult(result: Pick<SubagentResult, "error">): boolean {
+  return result.error !== "cancelled";
+}
+
+/**
  * State for a launched (but not yet completed) subagent.
  */
 interface RunningSubagent {
@@ -616,6 +627,10 @@ async function monitorKeptTab(kept: KeptTab, piInstance: ExtensionAPI): Promise<
       {
         interval: 2000,
         sessionFile: kept.sessionFile,
+        // M9: the first result was already delivered — a second `.done`
+        // (e.g. child-side `/reload` reset `completionSignaled`) must not
+        // end supervision of the still-live tab. `.exit` still reports.
+        ignoreDone: true,
         onTick() {
           deliverPendingQuestion(
             { name: kept.name, agent: kept.agent, sessionFile: kept.sessionFile, startTime: kept.startTime },
@@ -624,7 +639,10 @@ async function monitorKeptTab(kept: KeptTab, piInstance: ExtensionAPI): Promise<
         },
       },
     );
-    if (result.reason === "error") {
+    if (result.reason === "error" && !result.tabClosed) {
+      // H1 interplay: a kept tab closed after its first result is a normal
+      // silent close (the result was already delivered) — only genuine
+      // agent-loop errors (`.exit`) notify.
       try {
         notifyKeptTabErrorCanonical(piInstance as any, kept.name, result.errorMessage ?? "unknown");
       } catch {
@@ -650,6 +668,147 @@ function trackKeptTab(
   void monitorKeptTab(kept as unknown as KeptTab, piInstance);
 }
 
+/**
+ * Pure tri-state decision for reload recovery (H5), unit-testable without
+ * kitty. `tracked`: a watcher/monitor already owns the session (never
+ * double-watch). `kept`: a kept monitor owns it. `alive`: tab liveness —
+ * `false` (positively gone) prunes the dead surface so resume-by-name
+ * works; `null` (control-plane unknown, N3) watches rather than orphaning
+ * a possibly-live tab. Exported via `__test__`.
+ */
+function decideResurrectAction(state: {
+  tracked: boolean;
+  kept: boolean;
+  alive: boolean | null;
+}): "watch" | "prune" | "skip" {
+  if (state.tracked || state.kept) return "skip";
+  if (state.alive === false) return "prune";
+  return "watch";
+}
+/**
+ * Re-watch a still-live run orphaned by `/reload` (H5). The previous module
+ * instance's watcher died with the import-time abort-controller rotation
+ * while the kitty tab kept running; without a new watcher its result would
+ * never be delivered, its widget row would stay gone, and the tab would leak
+ * unsupervised. The resurrected run reuses the persisted `surface` +
+ * `sessionFile` (with stale-sidecar hygiene inherited from `pollForExit`: a
+ * pre-reload `.done`/`.exit` completes it immediately — which is correct,
+ * that signal was the result the dead watcher never delivered).
+ */
+function resurrectRunningTab(
+  artifactDir: string,
+  regName: string,
+  entry: { sessionFile: string; sessionId?: string | null; surface: string },
+  piInstance: ExtensionAPI,
+): boolean {
+  const sessionPath = entry.sessionFile;
+  if (!sessionPath || !existsSync(sessionPath)) return false;
+  // Liveness: positively-gone tabs get their dead surface pruned (so
+  // resume-by-name works); unknown control-plane keeps the watch (N3).
+  // Already-tracked sessions are never double-watched.
+  let alive: boolean | null;
+  try {
+    alive = windowExistsOrNull(entry.surface);
+  } catch {
+    alive = null;
+  }
+  const action = decideResurrectAction({
+    tracked: !!subagentStore.findRunningBySessionFile(sessionPath),
+    kept: subagentStore.kept.has(keptKeyCanonical(artifactDir, regName)),
+    alive,
+  });
+  if (action === "skip") return false;
+  if (action === "prune") {
+    try {
+      registerName(artifactDir, regName, {
+        sessionFile: sessionPath,
+        sessionId: entry.sessionId ?? null,
+      });
+    } catch {}
+    return false;
+  }
+  let agent: string | undefined;
+  try {
+    agent = readSubagentLoadout(sessionPath)?.agent ?? undefined;
+  } catch {
+    agent = undefined;
+  }
+  const id = Math.random().toString(16).slice(2, 10);
+  const now = Date.now();
+  const activityFile = getSubagentActivityFile(artifactDir, id);
+  try {
+    mkdirSync(dirname(activityFile), { recursive: true });
+  } catch {}
+  const running: RunningSubagent = {
+    id,
+    name: regName,
+    task: `(resumed after reload: ${regName})`,
+    agent,
+    surface: entry.surface,
+    startTime: now,
+    sessionFile: sessionPath,
+    activityFile,
+    parentArtifactDir: artifactDir,
+    keepSurface: false,
+    autoExit: true,
+    interactive: false,
+    statusState: createStatusState({ source: "pi", startTimeMs: now }),
+  };
+  runningSubagents.set(id, running);
+  const watcherAbort = new AbortController();
+  running.abortController = watcherAbort;
+  startWidgetRefresh();
+  startStatusRefresh(piInstance);
+  watchSubagent(running, watcherAbort.signal, piInstance)
+    .then((result) => {
+      updateWidget();
+      registerName(artifactDir, regName, {
+        sessionFile: sessionPath,
+        sessionId: result.sessionId ?? entry.sessionId ?? null,
+        ...(result.surfaceKept ? { surface: running.surface } : {}),
+      });
+      if (result.surfaceKept) {
+        trackKeptTab(
+          artifactDir,
+          {
+            name: regName,
+            agent: running.agent,
+            surface: running.surface,
+            sessionFile: sessionPath,
+            sessionId: result.sessionId ?? null,
+            startTime: running.startTime,
+          },
+          piInstance,
+        );
+      }
+      // M3: a watcher aborted by a later shutdown/reload must not steer
+      // into a dead session; teardown races never reject unhandled.
+      if (shouldNotifyResult(result)) {
+        try {
+          notifyResultCanonical(piInstance as any, {
+            name: regName,
+            task: running.task,
+            agent: running.agent,
+            summary: result.summary,
+            sessionFile: sessionPath,
+            sessionId: result.sessionId,
+            exitCode: result.exitCode,
+            elapsed: result.elapsed,
+            errorMessage: result.errorMessage,
+            surfaceKept: result.surfaceKept,
+          });
+        } catch {}
+      }
+    })
+    .catch((err) => {
+      updateWidget();
+      try {
+        notifyErrorCanonical(piInstance as any, regName, running.task, err);
+      } catch {}
+    });
+  return true;
+}
+
 // When this extension is loaded inside a subagent that itself spawns children
 // (e.g. a worker delegating to scout/researcher), `subagent-done.ts` runs in the
 // same process and needs to know whether this session still has children in
@@ -665,6 +824,14 @@ const RUNNING_CHILDREN_COUNT_KEY = Symbol.for("pi-subagents/running-children-cou
 let latestCtx: ExtensionContext | null = null;
 /** Latest ExtensionAPI, used to deliver ask_question notifications from the watcher. */
 let latestPi: ExtensionAPI | null = null;
+/**
+ * ExtensionContexts per spawner session, keyed by artifact dir (H4). The
+ * module-global `latestCtx` is last-writer-wins across sessions sharing one
+ * process; the widget must render into every live session's UI, not just
+ * the most recent one. Entries are added on `session_start` and removed on
+ * `session_shutdown`.
+ */
+const sessionCtxs = new Map<string, ExtensionContext>();
 
 /** Interval timer for widget re-renders. */
 let widgetInterval: ReturnType<typeof setInterval> | null = null;
@@ -709,14 +876,22 @@ function renderSubagentWidgetLines(agents: RunningSubagent[], width: number): st
     cli: agent.cli,
     snapshot: classifyStatus(agent.statusState, now),
   }));
-  return renderWidgetLinesCanonical(rows, width, { statusEnabled: getExtensionConfig().status.enabled });
+  return renderWidgetLinesCanonical(rows, width, { statusEnabled: getSafeExtensionConfig().status.enabled });
 }
 
 function updateWidget() {
-  if (!latestCtx?.hasUI) return;
+  // H4: render into every live session's UI (not just latestCtx).
+  const ctxs =
+    sessionCtxs.size > 0 ? [...sessionCtxs.values()] : latestCtx ? [latestCtx] : [];
+  const live = ctxs.filter((c) => (c as ExtensionContext | null)?.hasUI);
+  if (live.length === 0) return;
 
   if (runningSubagents.size === 0) {
-    latestCtx.ui.setWidget("subagent-status", undefined);
+    for (const c of live) {
+      try {
+        c.ui.setWidget("subagent-status", undefined);
+      } catch {}
+    }
     if (widgetInterval) {
       clearInterval(widgetInterval);
       widgetInterval = null;
@@ -725,18 +900,22 @@ function updateWidget() {
     return;
   }
 
-  latestCtx.ui.setWidget(
-    "subagent-status",
-    (_tui: any, _theme: any) => {
-      return {
-        invalidate() {},
-        render(width: number) {
-          return renderSubagentWidgetLines(Array.from(runningSubagents.values()), width);
+  for (const c of live) {
+    try {
+      c.ui.setWidget(
+        "subagent-status",
+        (_tui: any, _theme: any) => {
+          return {
+            invalidate() {},
+            render(width: number) {
+              return renderSubagentWidgetLines(Array.from(runningSubagents.values()), width);
+            },
+          };
         },
-      };
-    },
-    { placement: "aboveEditor" },
-  );
+        { placement: "aboveEditor" },
+      );
+    } catch {}
+  }
 }
 
 /**
@@ -892,7 +1071,8 @@ function handleSubagentSteer(
 }
 
 function startStatusRefresh(pi: ExtensionAPI) {
-  if (!getExtensionConfig().status.enabled || statusInterval) return;
+  // M4: timer paths degrade to last-good config (never throw per tick).
+  if (!getSafeExtensionConfig().status.enabled || statusInterval) return;
 
   statusInterval = setInterval(() => {
     if (runningSubagents.size === 0) {
@@ -928,7 +1108,7 @@ function startStatusRefresh(pi: ExtensionAPI) {
     if (shouldRefreshWidget) updateWidget();
 
     if (transitionLines.length > 0) {
-      const lineLimit = getExtensionConfig().status.lineLimit;
+      const lineLimit = getSafeExtensionConfig().status.lineLimit;
       const capped = capStatusLines(transitionLines, lineLimit);
       notifyStatusCanonical(pi as any, {
         content: formatStatusAggregate(transitionLines, lineLimit),
@@ -995,7 +1175,19 @@ export const __test__ = {
   contextWindowFor,
   formatUsageSegments,
   widgetIcon,
+  shouldNotifyResult,
+  restoreAskClaimNoClobber,
+  decideResurrectAction,
+  sessionCtxs,
+  startWidgetRefresh,
+  startStatusRefresh,
+  timersActiveForTest,
 };
+
+/** Test seam (H4): whether the shared widget/status timers are armed. */
+function timersActiveForTest(): { widget: boolean; status: boolean } {
+  return { widget: widgetInterval !== null, status: statusInterval !== null };
+}
 
 function startWidgetRefresh() {
   if (widgetInterval) return;
@@ -1385,19 +1577,93 @@ function claimAskFile(askFile: string): string | null {
   }
 }
 
+/**
+ * Promote the oldest queued `.pending-*` question to `.ask` when no live
+ * `.ask` exists (M2). The no-clobber restore below parks an undelivered
+ * payload here instead of overwriting a newer question; the next tick
+ * drains it. Best-effort, never throws.
+ */
+function promotePendingAskFile(sessionFile: string): void {
+  const askFile = `${sessionFile}.ask`;
+  try {
+    if (existsSync(askFile)) return;
+    const dir = dirname(askFile);
+    const base = basename(askFile);
+    let entries: string[];
+    try {
+      entries = readdirSync(dir);
+    } catch {
+      return;
+    }
+    const pending = entries.filter((f) => f.startsWith(`${base}.pending-`)).sort();
+    if (pending.length === 0) return;
+    try {
+      renameSync(join(dir, pending[0]), askFile);
+    } catch {}
+  } catch {}
+}
+
+/**
+ * Restore a claimed `.ask` payload without clobbering a newer question
+ * (M2). Returns `"restored"` when the claim is back at `.ask` (retry next
+ * tick) or `"kept-newer"` when a fresh `.ask` arrived while the claim was
+ * held — the held payload is parked as `.pending-*` for the next tick
+ * instead of overwriting the newer question (previously Q2 was lost
+ * silently). Never throws.
+ */
+function restoreAskClaimNoClobber(claim: string, askFile: string): "restored" | "kept-newer" {
+  try {
+    if (existsSync(askFile)) {
+      const pending = `${askFile}.pending-${process.pid}-${Math.random().toString(16).slice(2, 8)}`;
+      try {
+        renameSync(claim, pending);
+      } catch {
+        try {
+          unlinkSync(claim);
+        } catch {}
+      }
+      return "kept-newer";
+    }
+    renameSync(claim, askFile);
+    return "restored";
+  } catch {
+    try {
+      unlinkSync(claim);
+    } catch {}
+    return "kept-newer";
+  }
+}
+
 function deliverPendingQuestion(running: QuestionCarrier, piInstance?: ExtensionAPI | null): boolean {
+  // Drain any previously parked question first (M2 queue).
+  promotePendingAskFile(running.sessionFile);
   const askFile = `${running.sessionFile}.ask`;
+  const retryMarker = `${askFile}.corrupt-retry`;
   const claim = claimAskFile(askFile);
   if (!claim) return false;
   let payload: any = null;
   try {
     payload = JSON.parse(readFileSync(claim, "utf-8"));
   } catch {
-    // Truly corrupt (writer is atomic since C3, so not a partial flush) —
-    // drop the claim and move on.
+    // Compat-1: pre-C3 children write `.ask` non-atomically, so a partial
+    // flush from an old child parses as corrupt once. Retain-then-retry
+    // once (no-clobber) instead of deleting a real signal; drop only on the
+    // second consecutive failure. The pending queue cannot entomb it: a
+    // parked payload is promoted and re-attempted next tick, where the
+    // marker forces the drop.
     try {
-      unlinkSync(claim);
-    } catch {}
+      if (existsSync(retryMarker)) {
+        unlinkSync(claim);
+        unlinkSync(retryMarker);
+      } else {
+        writeFileSync(retryMarker, String(Date.now()), "utf8");
+        restoreAskClaimNoClobber(claim, askFile);
+      }
+    } catch {
+      try {
+        unlinkSync(claim);
+      } catch {}
+    }
     return false;
   }
   if (!payload?.question) {
@@ -1413,10 +1679,8 @@ function deliverPendingQuestion(running: QuestionCarrier, piInstance?: Extension
   // Envelope lives in notifications.ts (single sendMessage owner).
   const target = piInstance ?? latestPi;
   if (!target) {
-    // No session to notify — restore the claim for retry.
-    try {
-      renameSync(claim, askFile);
-    } catch {}
+    // No session to notify — restore the claim for retry (never clobber).
+    restoreAskClaimNoClobber(claim, askFile);
     return false;
   }
 
@@ -1432,11 +1696,13 @@ function deliverPendingQuestion(running: QuestionCarrier, piInstance?: Extension
       elapsedSec: elapsed,
       question: payload.question,
     });
-  } catch {
-    // Keep for retry: move the claim back so the next tick can re-claim it.
+    // A clean delivery retires any retry marker from an earlier torn read.
     try {
-      renameSync(claim, askFile);
+      unlinkSync(retryMarker);
     } catch {}
+  } catch {
+    // Keep for retry: park the claim (never overwrite a newer `.ask`).
+    restoreAskClaimNoClobber(claim, askFile);
     return false;
   }
   try {
@@ -1592,6 +1858,14 @@ export default function subagentsExtension(pi: ExtensionAPI) {
   pi.on("session_start", (_event, ctx) => {
     latestCtx = ctx;
     refreshConfigCache();
+    // H4: remember this session's UI context for widget fan-out (and forget
+    // it on shutdown) instead of rendering only into the latest session.
+    try {
+      const mgr0 = (ctx as any)?.sessionManager;
+      if (mgr0?.getSessionDir && mgr0?.getSessionId) {
+        sessionCtxs.set(getArtifactDir(mgr0.getSessionDir(), mgr0.getSessionId()), ctx);
+      }
+    } catch {}
     // pi runs multiple sessions in one process. A prior session's shutdown
     // aborts the shared module poll-abort controller; install a fresh one so
     // subagents spawned in this session aren't watched against a dead signal.
@@ -1615,6 +1889,10 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             const sf = (regEntry as { sessionFile?: unknown }).sessionFile;
             const surf = (regEntry as { surface?: unknown }).surface;
             if (typeof sf !== "string" || !sf || typeof surf !== "string" || !surf) continue;
+            // H5: entries flagged `running` are live runs for the resurrect
+            // pass below, not kept tabs — never attach a kept monitor here
+            // (it would swallow their completion result).
+            if ((regEntry as { running?: unknown }).running === true) continue;
             if (keptTabs.has(keptKey(artifactDir, regName))) continue;
             let alive = false;
             try {
@@ -1638,6 +1916,42 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         } catch {
           // Best effort — rebuild must never break session startup.
         }
+        // H5: re-watch live runs orphaned by `/reload`. The launch path
+        // marks running entries (`surface` + `running: true`); the completion
+        // handler clears the flag, so anything still flagged is a run whose
+        // watcher died with the previous module instance. Without this its
+        // result is lost, its widget row is gone, and the tab leaks
+        // unsupervised ("subagent vanished after reload").
+        try {
+          const registry = readNameRegistry(artifactDir);
+          for (const [regName, regEntry] of Object.entries(registry)) {
+            const rec = regEntry as {
+              sessionFile?: unknown;
+              sessionId?: unknown;
+              surface?: unknown;
+              running?: unknown;
+            };
+            if (rec.running !== true) continue;
+            if (typeof rec.sessionFile !== "string" || !rec.sessionFile) continue;
+            if (typeof rec.surface !== "string" || !rec.surface) continue;
+            try {
+              resurrectRunningTab(
+                artifactDir,
+                regName,
+                {
+                  sessionFile: rec.sessionFile,
+                  sessionId: typeof rec.sessionId === "string" ? rec.sessionId : null,
+                  surface: rec.surface,
+                },
+                pi,
+              );
+            } catch {
+              // Best effort — rebuild must never break session startup.
+            }
+          }
+        } catch {
+          // Best effort — rebuild must never break session startup.
+        }
       }
     } catch {
       // Best effort — a failed scan must never break session startup.
@@ -1649,22 +1963,17 @@ export default function subagentsExtension(pi: ExtensionAPI) {
   // at import. Aborting it would cancel other sessions' watchers sharing the
   // process. Resolve this session's artifact dir and tear down only its runs.)
   pi.on("session_shutdown", (_event, _ctx) => {
-    if (widgetInterval) {
-      clearInterval(widgetInterval);
-      widgetInterval = null;
-      (globalThis as any)[WIDGET_INTERVAL_KEY] = null;
-    }
-    if (statusInterval) {
-      clearInterval(statusInterval);
-      statusInterval = null;
-      (globalThis as any)[STATUS_INTERVAL_KEY] = null;
-    }
     let shuttingDir: string | null = null;
     try {
       const mgr = (_ctx as any)?.sessionManager;
       if (mgr?.getSessionDir && mgr?.getSessionId) {
         shuttingDir = getArtifactDir(mgr.getSessionDir(), mgr.getSessionId());
       }
+    } catch {}
+    // H4: forget this session's UI context first so later ticks never
+    // render into a dead session.
+    try {
+      if (shuttingDir) sessionCtxs.delete(shuttingDir);
     } catch {}
     const matchesDir = (dir: string | undefined) =>
       !shuttingDir || !dir || dir === shuttingDir;
@@ -1683,6 +1992,23 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           kept.abort.abort();
         } catch {}
         keptTabs.delete(key);
+      }
+    }
+    // H4: the widget/status timers are shared across sessions in one
+    // process — stand them down only when nothing is left to supervise or
+    // render. Unconditionally clearing them here used to blind surviving
+    // sessions (dead widget + no stall/recovery steers) when any session
+    // exited. Kept-tab monitors are independent async loops, unaffected.
+    if (runningSubagents.size === 0) {
+      if (widgetInterval) {
+        clearInterval(widgetInterval);
+        widgetInterval = null;
+        (globalThis as any)[WIDGET_INTERVAL_KEY] = null;
+      }
+      if (statusInterval) {
+        clearInterval(statusInterval);
+        statusInterval = null;
+        (globalThis as any)[STATUS_INTERVAL_KEY] = null;
       }
     }
   });
@@ -1859,9 +2185,16 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         // Persist name → session so subagent_message({ name }) can resume this
         // subagent after it finishes (and after a pi restart). Done at launch,
         // not completion, so the handle exists even if the parent dies mid-run.
+        // H5: persist the live `surface` too (marked `running`), so a
+        // `/reload` that orphans this run can re-watch the still-live tab on
+        // `session_start` instead of losing its result. The completion
+        // handler re-registers without `running` (keeping `surface` only for
+        // kept tabs), so the flag cannot go stale.
         registerName(parentArtifactDir, running.name, {
           sessionFile: running.sessionFile,
           sessionId: getSessionId(running.sessionFile),
+          surface: running.surface,
+          running: true,
         });
 
         // Create a separate AbortController for the watcher
@@ -1906,24 +2239,34 @@ export default function subagentsExtension(pi: ExtensionAPI) {
               );
             }
 
-            notifyResultCanonical(pi as any, {
-              name: running.name,
-              task: running.task,
-              agent: running.agent,
-              summary: result.summary,
-              sessionFile: result.sessionFile,
-              sessionId: result.sessionId,
-              claudeSessionId: result.claudeSessionId,
-              exitCode: result.exitCode,
-              elapsed: result.elapsed,
-              errorMessage: result.errorMessage,
-              stats: result.stats,
-              surfaceKept: result.surfaceKept,
-            });
+            if (shouldNotifyResult(result)) {
+              try {
+                notifyResultCanonical(pi as any, {
+                  name: running.name,
+                  task: running.task,
+                  agent: running.agent,
+                  summary: result.summary,
+                  sessionFile: result.sessionFile,
+                  sessionId: result.sessionId,
+                  claudeSessionId: result.claudeSessionId,
+                  exitCode: result.exitCode,
+                  elapsed: result.elapsed,
+                  errorMessage: result.errorMessage,
+                  stats: result.stats,
+                  surfaceKept: result.surfaceKept,
+                });
+              } catch {
+                // Teardown races sendMessage — never reject unhandled.
+              }
+            }
           })
           .catch((err) => {
             updateWidget();
-            notifyErrorCanonical(pi as any, running.name, running.task, err);
+            try {
+              notifyErrorCanonical(pi as any, running.name, running.task, err);
+            } catch {
+              // Teardown races sendMessage — never reject unhandled.
+            }
           });
 
         // Return immediately
@@ -2293,10 +2636,20 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
         const resumedSessionId = entry.sessionId ?? getSessionId(sessionPath) ?? requestedName;
 
-        // Record entry count before resuming so we can extract new messages.
-        // Count lines cheaply (no per-line JSON.parse) so resuming a large
-        // transcript doesn't block the UI.
-        const entryCountBefore = countSessionEntryLines(sessionPath);
+        // Record the new-entries baseline on the parsed-entry basis the
+        // completion path slices with (M7): `getNewEntries(f, n)` returns
+        // `parsed.slice(n)`, so the baseline must be the parsed length at
+        // resume time (`total - skipped`), not a raw line count. A torn line
+        // before the resume point would otherwise shift the window by one
+        // (missed or stale message in the follow-up summary). Note `total`
+        // alone counts torn lines too — only `total - skipped` is exact.
+        let entryCountBefore = 0;
+        try {
+          const base = readEntriesAfter(sessionPath, 0);
+          entryCountBefore = base.total - (base.skipped ?? 0);
+        } catch {
+          entryCountBefore = 0;
+        }
 
         const surface = createSurface(name);
         // C2: resume must not leak its tab if command-building/sending throws.
@@ -2486,29 +2839,31 @@ export default function subagentsExtension(pi: ExtensionAPI) {
                   ? `Subagent error: ${result.errorMessage}`
                   : "Resumed session exited without new output");
             }
-            notifyResultCanonical(pi as any, {
-              name,
-              task: message,
-              summary,
-              sessionFile: sessionPath,
-              sessionId: resumedSessionId,
-              exitCode: result.exitCode,
-              elapsed: result.elapsed,
-              errorMessage: result.errorMessage,
-              surfaceKept: result.surfaceKept,
-            });
+            if (shouldNotifyResult(result)) {
+              try {
+                notifyResultCanonical(pi as any, {
+                  name,
+                  task: message,
+                  summary,
+                  sessionFile: sessionPath,
+                  sessionId: resumedSessionId,
+                  exitCode: result.exitCode,
+                  elapsed: result.elapsed,
+                  errorMessage: result.errorMessage,
+                  surfaceKept: result.surfaceKept,
+                });
+              } catch {
+                // Teardown races sendMessage — never reject unhandled.
+              }
+            }
           })
           .catch((err) => {
             updateWidget();
-            pi.sendMessage(
-              {
-                customType: "subagent_result",
-                content: `Resume error: ${err?.message ?? String(err)}`,
-                display: true,
-                details: { name, error: err?.message },
-              },
-              { triggerTurn: true, deliverAs: "steer" },
-            );
+            try {
+              notifyErrorCanonical(pi as any, name, message, err);
+            } catch {
+              // Teardown races sendMessage — never reject unhandled.
+            }
           });
 
         return {

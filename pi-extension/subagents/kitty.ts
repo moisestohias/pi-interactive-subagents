@@ -355,6 +355,13 @@ export interface PollResult {
   exitCode: number;
   /** Error message if reason is "error" (auto-retry exhausted, provider overload, etc.) */
   errorMessage?: string;
+  /**
+   * True when the error is specifically tab death (H1 liveness probe): the
+   * window is positively gone with no sidecar. Lets the kept-tab monitor
+   * tell "closed after its first result" (silent) from a real agent-loop
+   * error (reported). Unset on all other results.
+   */
+  tabClosed?: boolean;
 }
 
 /**
@@ -404,7 +411,7 @@ function claimSidecarFile(path: string): string | null {
  * Returns null when neither exists. Files are claimed via rename and deleted
  * on read so each signal fires once, even with concurrent consumers (M1).
  */
-function takeCompletionSidecar(sessionFile: string): PollResult | null {
+function takeCompletionSidecar(sessionFile: string, opts?: { ignoreDone?: boolean }): PollResult | null {
   // N5: claim via rename BEFORE parse so a corrupt `.exit` can never poison
   // the poll loop forever (previously a JSON.parse throw skipped rmSync and
   // the same file was retried every tick).
@@ -427,6 +434,11 @@ function takeCompletionSidecar(sessionFile: string): PollResult | null {
   } catch {}
   try {
     const doneFile = `${sessionFile}.done`;
+    // M9: kept-tab monitors pass `ignoreDone` — after the first result the
+    // session stays interactive, so a second `.done` (e.g. after a child-side
+    // `/reload` resets `completionSignaled`) must not end supervision while
+    // the tab is still alive. Later `.ask`s keep relaying via the tick.
+    if (opts?.ignoreDone) return null;
     if (existsSync(doneFile)) {
       // M1: rename-claim like `.exit` (previously existsSync+rmSync, so two
       // concurrent consumers could both deliver). Presence alone is the
@@ -466,6 +478,11 @@ export async function pollForExit(
     onTick?: (elapsed: number) => void;
     exists?: (surface: string) => boolean | null;
     maxReadFailuresBeforeLivenessProbe?: number;
+    /**
+     * M9: watch `.exit`/sentinel only (leave `.done` files alone). Used by
+     * the kept-tab monitor after the first result was delivered.
+     */
+    ignoreDone?: boolean;
   },
 ): Promise<PollResult> {
   const start = Date.now();
@@ -480,7 +497,7 @@ export async function pollForExit(
 
     // Fast path: completion sidecars (.exit error / .done clean-but-open).
     if (options.sessionFile) {
-      const sidecar = takeCompletionSidecar(options.sessionFile);
+      const sidecar = takeCompletionSidecar(options.sessionFile, { ignoreDone: options.ignoreDone });
       if (sidecar) return sidecar;
     }
 
@@ -505,7 +522,7 @@ export async function pollForExit(
       readFailures += 1;
       // Surface may have been destroyed — check if a sidecar appeared in the meantime
       if (options.sessionFile) {
-        const sidecar = takeCompletionSidecar(options.sessionFile);
+        const sidecar = takeCompletionSidecar(options.sessionFile, { ignoreDone: options.ignoreDone });
         if (sidecar) return sidecar;
       }
       // H1: sustained get-text failure with no sidecar means the tab is
@@ -523,6 +540,7 @@ export async function pollForExit(
             reason: "error",
             exitCode: 1,
             errorMessage: `Subagent tab closed (window id ${surface}) before completion; no result was produced.`,
+            tabClosed: true,
           };
         }
         // `null` (control-plane unknown, N3) or `true`: keep polling, but
