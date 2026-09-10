@@ -259,6 +259,22 @@ export function sendCommand(surface: string, command: string): void {
  *
  * Returns the script path.
  */
+/**
+ * Sink-side preamble guard (C1). Every preamble line must remain a `# …`
+ * comment once written to the `bash`-executed script file: an interpolated
+ * value carrying `\\n` (e.g. the inline Claude preamble, which bypasses
+ * `scriptPreambleFor`) would otherwise escape the comment and execute.
+ * Lines that are not comments are neutralized with a `# ` prefix so the
+ * script stays syntactically inert. Exported for tests.
+ */
+export function sanitizeScriptPreamble(preamble: string): string {
+  return preamble
+    .split("\n")
+    .map((line) => line.replace(/\r/g, ""))
+    .map((line) => (line.trim() === "" || line.startsWith("#") ? line : `# ${line}`))
+    .join("\n");
+}
+
 export function sendLongCommand(
   surface: string,
   command: string,
@@ -275,7 +291,7 @@ export function sendLongCommand(
 
   const scriptParts = ["#!/bin/bash"];
   if (options?.scriptPreamble) {
-    scriptParts.push(options.scriptPreamble.trimEnd());
+    scriptParts.push(sanitizeScriptPreamble(options.scriptPreamble).trimEnd());
   }
   scriptParts.push(command);
 
@@ -362,10 +378,31 @@ function interpretExitSidecar(data: any): PollResult {
 }
 
 /**
+ * Claim a sidecar file via rename-before-read. Returns the claim path, or
+ * null when absent / already claimed by another consumer (race lost).
+ * Shared by `.exit` and `.done` so both deliver exactly once (M1).
+ */
+function claimSidecarFile(path: string): string | null {
+  try {
+    if (!existsSync(path)) return null;
+    const claim = `${path}.consuming-${process.pid}-${Math.random().toString(16).slice(2, 8)}`;
+    try {
+      renameSync(path, claim);
+    } catch {
+      return null; // another consumer claimed it
+    }
+    return claim;
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Consume a completion sidecar next to the session file, if present.
  * `.exit` (error) wins over `.done` (clean finish on a keep-open run:
  * config `tabs.keepOpen=true` + agent `auto-exit:false`, session left open).
- * Returns null when neither exists. Files are deleted on read so each signal fires once.
+ * Returns null when neither exists. Files are claimed via rename and deleted
+ * on read so each signal fires once, even with concurrent consumers (M1).
  */
 function takeCompletionSidecar(sessionFile: string): PollResult | null {
   // N5: claim via rename BEFORE parse so a corrupt `.exit` can never poison
@@ -374,12 +411,8 @@ function takeCompletionSidecar(sessionFile: string): PollResult | null {
   try {
     const exitFile = `${sessionFile}.exit`;
     if (existsSync(exitFile)) {
-      const claim = `${exitFile}.consuming-${process.pid}-${Math.random().toString(16).slice(2, 8)}`;
-      try {
-        renameSync(exitFile, claim);
-      } catch {
-        return null; // another consumer claimed it
-      }
+      const claim = claimSidecarFile(exitFile);
+      if (!claim) return null; // another consumer claimed it
       try {
         const data = JSON.parse(readFileSync(claim, "utf-8"));
         rmSync(claim, { force: true });
@@ -395,7 +428,14 @@ function takeCompletionSidecar(sessionFile: string): PollResult | null {
   try {
     const doneFile = `${sessionFile}.done`;
     if (existsSync(doneFile)) {
-      rmSync(doneFile, { force: true });
+      // M1: rename-claim like `.exit` (previously existsSync+rmSync, so two
+      // concurrent consumers could both deliver). Presence alone is the
+      // signal — no parse, so a valid `.done` is never dropped as "corrupt".
+      const claim = claimSidecarFile(doneFile);
+      if (!claim) return null; // another consumer claimed it
+      try {
+        rmSync(claim, { force: true });
+      } catch {}
       return { reason: "done", exitCode: 0 };
     }
   } catch {}
@@ -408,6 +448,13 @@ export const __pollForExitTest__ = { interpretExitSidecar, takeCompletionSidecar
  * Poll until the subagent exits. Checks for a `.exit` sidecar file first
  * (written by the error path), falling back to the terminal sentinel for
  * clean-completion and crash detection.
+ *
+ * H1: a dead tab is detected via the injected `exists` probe (defaults to
+ * `windowExistsOrNull`). After `maxReadFailuresBeforeLivenessProbe`
+ * consecutive `get-text` failures the tab is probed: `false` (positively
+ * gone) returns an error result instead of hanging forever; `null`
+ * (control-plane unknown, N3) keeps polling. Callers (`watchSubagent`,
+ * `monitorKeptTab`) both benefit without changes.
  */
 export async function pollForExit(
   surface: string,
@@ -417,9 +464,14 @@ export async function pollForExit(
     sessionFile?: string;
     sentinelFile?: string;
     onTick?: (elapsed: number) => void;
+    exists?: (surface: string) => boolean | null;
+    maxReadFailuresBeforeLivenessProbe?: number;
   },
 ): Promise<PollResult> {
   const start = Date.now();
+  const exists = options.exists ?? windowExistsOrNull;
+  const probeAfter = options.maxReadFailuresBeforeLivenessProbe ?? 3;
+  let readFailures = 0;
 
   for (;;) {
     if (signal.aborted) {
@@ -444,15 +496,38 @@ export async function pollForExit(
     // Slow path: read terminal screen for sentinel (crash detection)
     try {
       const screen = await readScreenAsync(surface, 5);
+      readFailures = 0;
       const match = screen.match(/__SUBAGENT_DONE_(\d+)__/);
       if (match) {
         return { reason: "sentinel", exitCode: parseInt(match[1], 10) };
       }
     } catch {
+      readFailures += 1;
       // Surface may have been destroyed — check if a sidecar appeared in the meantime
       if (options.sessionFile) {
         const sidecar = takeCompletionSidecar(options.sessionFile);
         if (sidecar) return sidecar;
+      }
+      // H1: sustained get-text failure with no sidecar means the tab is
+      // likely gone (its `; echo DONE` died with the shell). Probe liveness
+      // instead of polling forever and leaking the run.
+      if (readFailures >= probeAfter) {
+        let alive: boolean | null;
+        try {
+          alive = exists(surface);
+        } catch {
+          alive = null;
+        }
+        if (alive === false) {
+          return {
+            reason: "error",
+            exitCode: 1,
+            errorMessage: `Subagent tab closed (window id ${surface}) before completion; no result was produced.`,
+          };
+        }
+        // `null` (control-plane unknown, N3) or `true`: keep polling, but
+        // re-arm so a later death is still detected without a hot `ls` loop.
+        readFailures = 0;
       }
     }
 

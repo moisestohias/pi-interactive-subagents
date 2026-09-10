@@ -64,18 +64,35 @@ export function buildEnvPrefix(opts: EnvPrefixOpts): string {
   return parts.join(" ") + " ";
 }
 
+/**
+ * Strip control characters from a preamble field. Preamble lines are `# …`
+ * comments inside a `bash`-executed script file — an interior newline in an
+ * interpolated value (LLM-controlled `name`, or `cwd`-derived paths) would
+ * escape the comment and execute as shell (C1). Collapsing to spaces keeps
+ * every field on its own comment line. The sink (`sendLongCommand` in
+ * kitty.ts) re-validates each preamble line defensively.
+ */
+export function sanitizePreambleField(value: string | undefined): string | undefined {
+  if (value == null) return value;
+  return String(value).replace(/[\r\n]+/g, " ");
+}
+
 /** `# …` preamble lines for launch/resume scripts (one format, one place). */
 export function scriptPreambleFor(
   kind: "launch" | "resume" | "claude-launch",
   meta: { name: string; sessionFile?: string; surface: string; resumeMsgFile?: string },
 ): string {
+  const name = sanitizePreambleField(meta.name) ?? "";
+  const sessionFile = sanitizePreambleField(meta.sessionFile);
+  const surface = sanitizePreambleField(meta.surface) ?? "";
+  const resumeMsgFile = sanitizePreambleField(meta.resumeMsgFile);
   const lines = [
-    `# Subagent ${kind} script for ${meta.name}`,
+    `# Subagent ${kind} script for ${name}`,
     `# Generated: ${new Date().toISOString()}`,
   ];
-  if (meta.sessionFile) lines.push(`# Session: ${meta.sessionFile}`);
-  lines.push(`# Surface: ${meta.surface}`);
-  if (meta.resumeMsgFile) lines.push(`# Resume message file: ${meta.resumeMsgFile}`);
+  if (sessionFile) lines.push(`# Session: ${sessionFile}`);
+  lines.push(`# Surface: ${surface}`);
+  if (resumeMsgFile) lines.push(`# Resume message file: ${resumeMsgFile}`);
   return lines.join("\n");
 }
 

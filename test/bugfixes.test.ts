@@ -173,3 +173,140 @@ describe("C3/M4 atomic ask consume", () => {
     assert.equal(existsSync(`${sessionFile}.ask`), false);
   });
 });
+
+describe("C1 preamble injection (RCE)", () => {
+  it("scriptPreambleFor keeps every line a comment (all fields, all kinds)", async () => {
+    const { scriptPreambleFor } = await import("../pi-extension/subagents/launch.ts");
+    const evil = "a\ntouch /tmp/pwned\n#";
+    for (const kind of ["launch", "resume", "claude-launch"] as const) {
+      const pre = scriptPreambleFor(kind, {
+        name: evil,
+        sessionFile: "/s\nbad",
+        surface: "7\nbad",
+        resumeMsgFile: "/m\nbad",
+      });
+      for (const line of pre.split("\n")) {
+        assert.ok(line.startsWith("#"), `preamble line must stay a comment: ${line}`);
+      }
+    }
+  });
+
+  it("sink sanitizeScriptPreamble neutralizes non-comment lines (Claude inline path)", async () => {
+    const { sanitizeScriptPreamble } = await import("../pi-extension/subagents/kitty.ts");
+    // Verbatim shape of the inline Claude preamble with an evil name.
+    const raw = [
+      "# Claude Code subagent launch script for a",
+      "touch /tmp/pwned-from-name",
+      "# Surface: 7",
+      "",
+    ].join("\n");
+    const clean = sanitizeScriptPreamble(raw);
+    for (const line of clean.split("\n")) {
+      assert.ok(
+        line.trim() === "" || line.startsWith("#"),
+        `sink line must stay a comment: ${line}`,
+      );
+    }
+    assert.ok(!clean.split("\n").some((l) => l === "touch /tmp/pwned-from-name"));
+  });
+});
+
+describe("H1 tab-death detection", () => {
+  it("pollForExit returns an error when the tab is positively gone", async () => {
+    const { pollForExit } = await import("../pi-extension/subagents/kitty.ts");
+    const ctrl = new AbortController();
+    // No sessionFile/sentinel: only the get-text path runs. requireKitty
+    // throws (no socket in unit tests), failures accumulate, then the
+    // injected probe reports the tab gone.
+    const result = await pollForExit("99999", ctrl.signal, {
+      interval: 5,
+      exists: () => false,
+      maxReadFailuresBeforeLivenessProbe: 2,
+    });
+    assert.equal(result.reason, "error");
+    assert.equal(result.exitCode, 1);
+    assert.match(result.errorMessage ?? "", /closed/);
+  });
+
+  it("pollForExit keeps polling on control-plane unknown (N3)", async () => {
+    const { pollForExit } = await import("../pi-extension/subagents/kitty.ts");
+    const ctrl = new AbortController();
+    const done = pollForExit("99999", ctrl.signal, {
+      interval: 5,
+      exists: () => null,
+      maxReadFailuresBeforeLivenessProbe: 2,
+    });
+    // Abort instead of resolving: unknown must never convert to death.
+    setTimeout(() => ctrl.abort(), 40);
+    await assert.rejects(done, /Aborted/);
+  });
+});
+
+describe("H6 resume reservation", () => {
+  it("reservation key blocks a second resume for the same name only", () => {
+    const reserved = testApi.subagentStore.reserved as Set<string>;
+    const key = (artifactDir: string, name: string) => `resume::${artifactDir}::${name}`;
+    const k1 = key("/art/aaa", "X");
+    const kSame = key("/art/aaa", "X");
+    const kOtherName = key("/art/aaa", "Y");
+    const kOtherSession = key("/art/bbb", "X");
+    assert.equal(reserved.has(k1), false);
+    reserved.add(k1);
+    try {
+      // Second concurrent resume for the same spawner session + name collides.
+      assert.equal(reserved.has(kSame), true);
+      // Different names / sessions are unaffected (namespaced key).
+      assert.equal(reserved.has(kOtherName), false);
+      assert.equal(reserved.has(kOtherSession), false);
+      // Spawn-time dedupe is unaffected: namespaced keys never equal a
+      // display name, so uniqueRunningName ignores them.
+      assert.equal(testApi.uniqueRunningName("X", new Set()), "X");
+    } finally {
+      reserved.delete(k1);
+    }
+    assert.equal(reserved.has(k1), false);
+  });
+});
+
+describe("H3 atomic sidecars", () => {
+  it("writeCompletionSidecarAtomic round-trips through the parent claim", async () => {
+    const mod = await import("../pi-extension/subagents/subagent-done.ts");
+    const { __pollForExitTest__ } = await import("../pi-extension/subagents/kitty.ts");
+    const dir = mkdtempSync(join(tmpdir(), "h3-"));
+    const sessionFile = join(dir, "s.jsonl");
+    writeFileSync(sessionFile, JSON.stringify({ type: "session", id: "s" }) + "\n");
+    mod.writeCompletionSidecarAtomic(sessionFile, "exit", {
+      type: "error",
+      errorMessage: "boom",
+      stopReason: "error",
+    });
+    const result = __pollForExitTest__.takeCompletionSidecar(sessionFile);
+    assert.equal(result?.reason, "error");
+    assert.equal(result?.errorMessage, "boom");
+    assert.equal(existsSync(`${sessionFile}.exit`), false);
+  });
+
+  it("writeAskSignalAtomic still round-trips (no regression)", async () => {
+    const mod = await import("../pi-extension/subagents/subagent-done.ts");
+    const dir = mkdtempSync(join(tmpdir(), "h3-ask-"));
+    const sessionFile = join(dir, "s.jsonl");
+    writeFileSync(sessionFile, JSON.stringify({ type: "session", id: "s" }) + "\n");
+    mod.writeAskSignalAtomic(sessionFile, { name: "w", question: "q?" });
+    assert.ok(existsSync(`${sessionFile}.ask`));
+  });
+});
+
+describe("M1 done-claim delivers once", () => {
+  it("concurrent takeCompletionSidecar on one .done delivers once", async () => {
+    const { __pollForExitTest__ } = await import("../pi-extension/subagents/kitty.ts");
+    const dir = mkdtempSync(join(tmpdir(), "m1-"));
+    const sessionFile = join(dir, "s.jsonl");
+    writeFileSync(sessionFile, JSON.stringify({ type: "session", id: "s" }) + "\n");
+    writeFileSync(`${sessionFile}.done`, JSON.stringify({ type: "done" }), "utf8");
+    const first = __pollForExitTest__.takeCompletionSidecar(sessionFile);
+    const second = __pollForExitTest__.takeCompletionSidecar(sessionFile);
+    assert.deepEqual(first, { reason: "done", exitCode: 0 });
+    assert.equal(second, null);
+    assert.equal(existsSync(`${sessionFile}.done`), false);
+  });
+});

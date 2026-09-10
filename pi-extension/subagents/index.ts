@@ -1772,6 +1772,35 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           };
         }
 
+        // C1: display `name` lands in `# …` preamble comments of a
+        // `bash`-executed script file, and `cwd` feeds `join()`-derived paths
+        // that land in the same comments. Interior newlines would escape the
+        // comment and execute as shell — reject control characters at the
+        // tool boundary (the sink in `sendLongCommand` re-validates
+        // defensively, covering resumed/registry names too).
+        if (params.name != null && /[\r\n\0]/.test(params.name)) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: "`name` must not contain newline or control characters.",
+              },
+            ],
+            details: { error: "invalid name" },
+          };
+        }
+        if (params.cwd != null && /[\r\n\0]/.test(params.cwd)) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: "`cwd` must not contain newline or control characters.",
+              },
+            ],
+            details: { error: "invalid cwd" },
+          };
+        }
+
         // Validate prerequisites (need mux + a session file to derive the
         // artifact dir that hosts this session's name registry).
         if (!isKittyAvailable()) {
@@ -2113,6 +2142,12 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           const err = "Provide the subagent's `name` to steer (if running) or resume (if finished).";
           return { content: [{ type: "text" as const, text: err }], details: { error: err } };
         }
+        // C1: the resume preamble interpolates this name into `# …`
+        // comments of a `bash`-executed script (covered at the sink too).
+        if (/[\r\n\0]/.test(requestedName)) {
+          const err = "`name` must not contain newline or control characters.";
+          return { content: [{ type: "text" as const, text: err }], details: { error: err } };
+        }
 
         if (!isKittyAvailable()) {
           return muxUnavailableResult();
@@ -2168,11 +2203,35 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           return { content: [{ type: "text" as const, text: err }], details: { error: err } };
         }
 
+        // H6: reserve the resume synchronously (before any `await`) so two
+        // concurrent `subagent_message({ name })` calls cannot both pass the
+        // guards below and double-open one `.jsonl` with two pi processes.
+        // The key lives in its own `resume::` namespace so spawn-time
+        // `uniqueRunningName` dedupe (which consults the same set) is
+        // unaffected. Missing #5: the reservation precedes the stale
+        // `.done`/`.exit` unlink below, making that ordering structural.
+        const resumeKey = `resume::${parentArtifactDir}::${requestedName}`;
+        if (reservedNames.has(resumeKey)) {
+          const err =
+            `A resume for subagent "${requestedName}" is already in progress. ` +
+            `Retry in a moment, or steer it by name if it is running.`;
+          return { content: [{ type: "text" as const, text: err }], details: { error: "resume in progress", name: requestedName } };
+        }
+        reservedNames.add(resumeKey);
+        let resumeReleased = false;
+        const releaseResume = () => {
+          if (!resumeReleased) {
+            resumeReleased = true;
+            reservedNames.delete(resumeKey);
+          }
+        };
+
         // Guard: never resume a session that is still running — two processes
         // mutating the same .jsonl corrupts it. Steer it by name instead.
         for (const r of runningSubagents.values()) {
           if (resolve(r.sessionFile) === resolve(sessionPath)) {
             const err = `Subagent "${requestedName}" is still running as "${r.name}". Your message will steer it; resending as a steer.`;
+            releaseResume();
             return handleSubagentSteer({ name: r.name, message: params.message });
           }
         }
@@ -2189,6 +2248,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
               params.message,
             );
             if (!("error" in steer)) {
+              releaseResume();
               return {
                 content: [{
                   type: "text" as const,
@@ -2204,6 +2264,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             const err =
               `Subagent "${requestedName}" is still open in its kept tab. ` +
               `Type your follow-up directly in that tab, or close the tab and retry.`;
+            releaseResume();
             return { content: [{ type: "text" as const, text: err }], details: { error: err } };
           }
         }
@@ -2226,6 +2287,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             `(it predates sandboxed resume, or its .loadout.json sidecar was removed). ` +
             `Resuming would relaunch with all global extensions and the full toolset, so this is refused. ` +
             `Re-run the task as a fresh subagent instead.`;
+          releaseResume();
           return { content: [{ type: "text" as const, text: err }], details: { error: err } };
         }
 
@@ -2245,6 +2307,46 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         };
         try {
           await new Promise<void>((resolve) => setTimeout(resolve, getShellReadyDelayMs()));
+          // H6 re-check: a concurrent resume may have registered while this
+          // call awaited the shell-ready delay. Never double-open one `.jsonl`
+          // with two pi processes — steer into the winner instead.
+          {
+            let raced: RunningSubagent | null = null;
+            for (const r of runningSubagents.values()) {
+              try {
+                if (resolve(r.sessionFile) === resolve(sessionPath)) { raced = r; break; }
+              } catch { /* ignore unresolvable paths */ }
+            }
+            if (raced) {
+              closeResumeSurface();
+              releaseResume();
+              return handleSubagentSteer({ name: raced.name, message: params.message });
+            }
+            if (entry.surface) {
+              const racedKept = findKeptTab(parentArtifactDir, requestedName);
+              if (racedKept) {
+                const racedSteer = steerSubagent(
+                  { surface: racedKept.surface, name: racedKept.name } as RunningSubagent,
+                  params.message,
+                );
+                if (!("error" in racedSteer)) {
+                  closeResumeSurface();
+                  releaseResume();
+                  return {
+                    content: [{
+                      type: "text" as const,
+                      text:
+                        `Message delivered to "${requestedName}" in its kept tab. It picks this up at its next ` +
+                        `turn boundary.`,
+                    }],
+                    details: { name: requestedName, status: "steered-kept" },
+                  };
+                }
+                // Steer failed (tab died between checks) — fall through and
+                // relaunch below; the liveness probes will refuse if alive.
+              }
+            }
+          }
         const parts = ["pi", "--session", shellEscape(sessionPath)];
 
         // Load subagent-done extension so the agent can self-terminate if needed
@@ -2321,6 +2423,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           });
         } catch (err) {
           closeResumeSurface();
+          releaseResume();
           throw err;
         }
 
@@ -2345,6 +2448,9 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           }),
         };
         runningSubagents.set(id, running);
+        // H6: the run is now tracked via the running map (the same guard
+        // concurrent resumes check), so the pre-registration reservation ends.
+        releaseResume();
         startWidgetRefresh();
         startStatusRefresh(pi);
 

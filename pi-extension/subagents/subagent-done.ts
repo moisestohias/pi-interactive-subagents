@@ -47,14 +47,36 @@ export {
 export type { SubagentErrorInfo } from "./subagent-done-pure.ts";
 
 /**
+ * Atomic JSON sidecar write (C3/H3): tmp file + rename so parent polls never
+ * observe a partway-flushed payload. The parent's rename-claim would
+ * otherwise grab a truncated file, fail JSON.parse, and delete a real
+ * signal as "corrupt" while the child's remaining bytes go to the renamed
+ * inode (lost). Used for `.ask`, `.exit`, and `.done` alike.
+ */
+function writeSidecarJsonAtomic(target: string, data: unknown): void {
+  const tmp = `${target}.tmp-${process.pid}-${Math.random().toString(16).slice(2, 8)}`;
+  writeFileSync(tmp, JSON.stringify(data), "utf8");
+  renameSync(tmp, target);
+}
+
+/**
  * Atomic `.ask` signal write (C3): tmp file + rename so parent polls never
  * observe a partway-flushed payload. Exported for tests.
  */
 export function writeAskSignalAtomic(sessionFile: string, data: unknown): void {
-  const target = `${sessionFile}.ask`;
-  const tmp = `${target}.tmp-${process.pid}-${Math.random().toString(16).slice(2, 8)}`;
-  writeFileSync(tmp, JSON.stringify(data), "utf8");
-  renameSync(tmp, target);
+  writeSidecarJsonAtomic(`${sessionFile}.ask`, data);
+}
+
+/**
+ * Atomic completion-signal write (H3): `.exit` (error) or `.done` (keep-open
+ * clean finish). Same tmp+rename protocol as `.ask`. Exported for tests.
+ */
+export function writeCompletionSidecarAtomic(
+  sessionFile: string,
+  kind: "exit" | "done",
+  data: unknown,
+): void {
+  writeSidecarJsonAtomic(`${sessionFile}.${kind}`, data);
 }
 
 export default function (pi: ExtensionAPI) {
@@ -209,14 +231,11 @@ export default function (pi: ExtensionAPI) {
       const sessionFile = process.env.PI_SUBAGENT_SESSION;
       if (errorInfo && sessionFile) {
         try {
-          writeFileSync(
-            `${sessionFile}.exit`,
-            JSON.stringify({
-              type: "error",
-              errorMessage: errorInfo.errorMessage,
-              stopReason: errorInfo.stopReason,
-            }),
-          );
+          writeCompletionSidecarAtomic(sessionFile, "exit", {
+            type: "error",
+            errorMessage: errorInfo.errorMessage,
+            stopReason: errorInfo.stopReason,
+          });
         } catch {
           // Best effort — even without the sidecar, watcher's session-file
           // fallback can still recover the errorMessage.
@@ -238,16 +257,13 @@ export default function (pi: ExtensionAPI) {
       if (sessionFile) {
         try {
           if (errorInfo) {
-            writeFileSync(
-              `${sessionFile}.exit`,
-              JSON.stringify({
-                type: "error",
-                errorMessage: errorInfo.errorMessage,
-                stopReason: errorInfo.stopReason,
-              }),
-            );
+            writeCompletionSidecarAtomic(sessionFile, "exit", {
+              type: "error",
+              errorMessage: errorInfo.errorMessage,
+              stopReason: errorInfo.stopReason,
+            });
           } else {
-            writeFileSync(`${sessionFile}.done`, JSON.stringify({ type: "done" }));
+            writeCompletionSidecarAtomic(sessionFile, "done", { type: "done" });
           }
         } catch {
           // Best effort — the watcher falls back to the session file.
