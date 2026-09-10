@@ -67,6 +67,22 @@ export function formatTokens(n: number): string {
   return n < 1000 ? String(n) : n < 10000 ? `${(n / 1000).toFixed(1)}k` : `${Math.round(n / 1000)}k`;
 }
 
+// ── Artifact timestamps (S3) ────────────────────────────────────────────────
+// The `toISOString().replace(/[:.]/g,"-").slice(0,19)` pattern appeared 5×
+// (launch/resume artifacts + sysprompt files) plus a distinct 23-char+`Z`
+// session-filename shape. One helper for artifacts, one for session files —
+// so the next reader can't "unify" the session filename into artifact format.
+// 19 chars: `2026-01-02T03-04-05`. 23 chars: `2026-01-02T03-04-05-123` (+`Z`).
+/** Sortable artifact timestamp tag: 19 chars by default. */
+export function timestampTag(now: Date = new Date(), len: 19 | 23 = 19): string {
+  return now.toISOString().replace(/[:.]/g, "-").slice(0, len);
+}
+
+/** Sortable session filename timestamp: 23 chars + `Z` (distinct shape, not just length). */
+export function sessionTimestamp(now: Date = new Date()): string {
+  return `${timestampTag(now, 23)}Z`;
+}
+
 /**
  * Known context-window size by model id substring, used for the context-usage
  * gauge. Unknown models fall back to undefined (window-less "Nk ctx" label).

@@ -6,6 +6,8 @@ import { buildClaudeCommand } from "../pi-extension/subagents/cli/claude.ts";
 import {
   buildCdPrefix,
   buildEnvPrefix,
+  buildPiLaunchPlan,
+  buildPiResumePlan,
   scriptPreambleFor,
   scriptPathFor,
   withDoneSentinel,
@@ -14,8 +16,11 @@ import {
   applySandboxToParts,
   buildPiParts,
   writeTaskArtifact,
+  writeResumeMessageFile,
   SCRUB_PREFIX,
 } from "../pi-extension/subagents/launch.ts";
+import { timestampTag, sessionTimestamp } from "../pi-extension/subagents/format.ts";
+import { contextArtifactName, launchScriptName, resumeScriptName } from "../pi-extension/subagents/names.ts";
 import { mkdtempSync, readFileSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -143,7 +148,7 @@ describe("launch.ts builders (R2 single command shape)", () => {
   });
 });
 
-describe("Phase 0 — exact command snapshots (byte-identical gate, no source changes)", () => {
+describe("Phase 2/3 — unified plan pipeline (single env order, T2/T3)", () => {
   // Fixed inputs shared by all snapshots in this block. Timestamps/ids are
   // pinned (not Date.now()/Math.random()) so snapshots are deterministic.
   const FIX = {
@@ -170,82 +175,26 @@ describe("Phase 0 — exact command snapshots (byte-identical gate, no source ch
       .map((tok) => tok.split("=")[0]);
   }
 
-  /**
-   * Verbatim replica of the inline launch env assembly
-   * (index.ts launchSubagent ~1217-1244): NAME before AGENT.
-   * Pinned here so the unification PR shows the order fix as a reviewed diff.
-   */
-  function inlineLaunchEnv(o: {
-    agentDir: string | null;
-    spawnable: string[] | null;
-    grantSpawning: boolean;
-    agent: string | null;
-    name: string;
-    autoExit: boolean;
-    sessionFile: string;
-    childId: string;
-    activityFile: string;
-    surface: string;
-  }): string {
-    const envParts: string[] = [];
-    if (o.agentDir) envParts.push(`PI_CODING_AGENT_DIR=${shellEscape(o.agentDir)}`);
-    if (o.grantSpawning && o.spawnable) {
-      envParts.push(`PI_SUBAGENT_ALLOWED=${shellEscape(o.spawnable.join(","))}`);
-    }
-    envParts.push(`PI_SUBAGENT_NAME=${shellEscape(o.name)}`);
-    if (o.agent) envParts.push(`PI_SUBAGENT_AGENT=${shellEscape(o.agent)}`);
-    if (o.autoExit) envParts.push(`PI_SUBAGENT_AUTO_EXIT=1`);
-    envParts.push(`PI_SUBAGENT_SESSION=${shellEscape(o.sessionFile)}`);
-    envParts.push(`PI_SUBAGENT_ID=${shellEscape(o.childId)}`);
-    envParts.push(`PI_SUBAGENT_ACTIVITY_FILE=${shellEscape(o.activityFile)}`);
-    envParts.push(`PI_SUBAGENT_SURFACE=${shellEscape(o.surface)}`);
-    return envParts.join(" ") + " ";
-  }
+  // Reviewed unification (T2/T3): the old snapshots pinned a three-way
+  // disagreement — canonical AGENT-before-NAME vs inline-launch NAME-before-
+  // AGENT vs inline-resume AGENT-before-NAME with no SURFACE and AUTO_EXIT
+  // last. Both plans now share buildEnvPrefix: AGENT before NAME, SURFACE
+  // last, AUTO_EXIT after NAME (first-class `autoExit`). SURFACE is
+  // write-only today (M10: no reader), so including it in resume is benign.
+  const UNIFIED_ORDER = [
+    "PI_CODING_AGENT_DIR",
+    "PI_SUBAGENT_ALLOWED",
+    "PI_SUBAGENT_AGENT",
+    "PI_SUBAGENT_NAME",
+    "PI_SUBAGENT_AUTO_EXIT",
+    "PI_SUBAGENT_SESSION",
+    "PI_SUBAGENT_ID",
+    "PI_SUBAGENT_ACTIVITY_FILE",
+    "PI_SUBAGENT_SURFACE",
+  ];
 
-  /**
-   * Verbatim replica of the inline resume env assembly
-   * (index.ts subagent_message resume ~2278-2300): AGENT before NAME,
-   * no SURFACE, AUTO_EXIT last.
-   */
-  function inlineResumeEnv(o: {
-    agentDir: string | null;
-    spawnable: string[] | null;
-    agent: string | null;
-    name: string;
-    autoExit: boolean;
-    sessionPath: string;
-    childId: string;
-    activityFile: string;
-  }): string {
-    const resumeEnvParts: string[] = [];
-    if (o.agentDir) resumeEnvParts.push(`PI_CODING_AGENT_DIR=${shellEscape(o.agentDir)}`);
-    if (o.spawnable && o.spawnable.length > 0) {
-      resumeEnvParts.push(`PI_SUBAGENT_ALLOWED=${shellEscape(o.spawnable.join(","))}`);
-    }
-    if (o.agent) resumeEnvParts.push(`PI_SUBAGENT_AGENT=${shellEscape(o.agent)}`);
-    resumeEnvParts.push(`PI_SUBAGENT_NAME=${shellEscape(o.name)}`);
-    resumeEnvParts.push(`PI_SUBAGENT_SESSION=${shellEscape(o.sessionPath)}`);
-    resumeEnvParts.push(`PI_SUBAGENT_ID=${shellEscape(o.childId)}`);
-    resumeEnvParts.push(`PI_SUBAGENT_ACTIVITY_FILE=${shellEscape(o.activityFile)}`);
-    if (o.autoExit) resumeEnvParts.push(`PI_SUBAGENT_AUTO_EXIT=1`);
-    return resumeEnvParts.join(" ") + " ";
-  }
-
-  /**
-   * Verbatim replica of the inline Claude launch preamble
-   * (index.ts claude path ~1136-1140) — hand-built, bypasses
-   * scriptPreambleFor. Pinned verbatim (C1 fix must cover this site too).
-   */
-  function inlineClaudePreamble(name: string, surface: string): string {
-    return [
-      `# Claude Code subagent launch script for ${name}`,
-      `# Generated: 2026-01-02T03:04:05.000Z`,
-      `# Surface: ${surface}`,
-    ].join("\n");
-  }
-
-  it("env-order pin documents the three-way disagreement (T2)", () => {
-    const opts = {
+  it("one env order across launch, resume, and buildEnvPrefix (T2/T3)", () => {
+    const envOpts = {
       agentDir: FIX.agentDir,
       spawnable: FIX.spawnable,
       agent: FIX.agent,
@@ -256,59 +205,59 @@ describe("Phase 0 — exact command snapshots (byte-identical gate, no source ch
       surface: FIX.surface,
       autoExit: true,
     };
-    const canonicalOrder = keysOf(buildEnvPrefix(opts));
-    const launchOrder = keysOf(
-      inlineLaunchEnv({ ...opts, grantSpawning: true }),
-    );
-    const resumeOrder = keysOf(
-      inlineResumeEnv({ ...opts, sessionPath: opts.sessionFile }),
-    );
+    assert.deepEqual(keysOf(buildEnvPrefix(envOpts)), UNIFIED_ORDER);
 
-    // Canonical: AGENT before NAME (launch.ts:50-66).
-    assert.deepEqual(canonicalOrder, [
-      "PI_CODING_AGENT_DIR",
-      "PI_SUBAGENT_ALLOWED",
-      "PI_SUBAGENT_AGENT",
-      "PI_SUBAGENT_NAME",
-      "PI_SUBAGENT_AUTO_EXIT",
-      "PI_SUBAGENT_SESSION",
-      "PI_SUBAGENT_ID",
-      "PI_SUBAGENT_ACTIVITY_FILE",
-      "PI_SUBAGENT_SURFACE",
-    ]);
-    // Inline launch: NAME before AGENT (index.ts ~1241-1244) — disagrees.
-    assert.deepEqual(launchOrder, [
-      "PI_CODING_AGENT_DIR",
-      "PI_SUBAGENT_ALLOWED",
-      "PI_SUBAGENT_NAME",
-      "PI_SUBAGENT_AGENT",
-      "PI_SUBAGENT_AUTO_EXIT",
-      "PI_SUBAGENT_SESSION",
-      "PI_SUBAGENT_ID",
-      "PI_SUBAGENT_ACTIVITY_FILE",
-      "PI_SUBAGENT_SURFACE",
-    ]);
-    // Inline resume: AGENT before NAME like canonical, but NO SURFACE and
-    // AUTO_EXIT last (index.ts ~2284-2300).
-    assert.deepEqual(resumeOrder, [
-      "PI_CODING_AGENT_DIR",
-      "PI_SUBAGENT_ALLOWED",
-      "PI_SUBAGENT_AGENT",
-      "PI_SUBAGENT_NAME",
-      "PI_SUBAGENT_SESSION",
-      "PI_SUBAGENT_ID",
-      "PI_SUBAGENT_ACTIVITY_FILE",
-      "PI_SUBAGENT_AUTO_EXIT",
-    ]);
+    const launchLoadout = {
+      agent: FIX.agent,
+      toolAllowlist: "read,ask_question",
+      model: "test-model",
+      thinking: null,
+      systemPromptMode: null,
+      identity: null,
+      spawnable: FIX.spawnable,
+      autoExit: true,
+      cwd: FIX.cwd,
+      agentDir: FIX.agentDir,
+    } as const;
+    const launchDir = mkdtempSync(join(tmpdir(), "phase23-env-"));
+    const launchTaskArg = writeTaskArtifact(launchDir, FIX.name, "t", FIX.artifactTs);
+    const launch = buildPiLaunchPlan({
+      sessionFile: FIX.sessionFile,
+      loadout: launchLoadout as any,
+      artifactDir: launchDir,
+      name: FIX.name,
+      surface: FIX.surface,
+      taskArg: launchTaskArg,
+      effectiveSkills: FIX.skills,
+      taskDelivery: "artifact",
+      childId: FIX.id,
+      activityFile: FIX.activityFile,
+      autoExit: true,
+      targetCwd: FIX.cwd,
+    });
+    assert.deepEqual(keysOf(launch.envPrefix), UNIFIED_ORDER);
 
-    // The disagreement is the point: do not "fix" here. The Phase-5
-    // unification PR updates this test to assert one shared order.
-    assert.notDeepEqual(canonicalOrder, launchOrder);
-    assert.ok(!resumeOrder.includes("PI_SUBAGENT_SURFACE"));
+    const resumeDir = mkdtempSync(join(tmpdir(), "phase23-env-r-"));
+    const resume = buildPiResumePlan({
+      sessionPath: FIX.sessionFile,
+      loadout: { ...launchLoadout, autoExit: false } as any,
+      artifactDir: resumeDir,
+      name: FIX.name,
+      surface: FIX.surface,
+      id: "resume1",
+      activityFile: "/art/activity-resume1.json",
+      message: "follow up please",
+      resumeCwd: FIX.cwd,
+      stamp: 456,
+      msgTimestamp: FIX.msgTs,
+    });
+    assert.deepEqual(keysOf(resume.envPrefix), UNIFIED_ORDER);
+    // AUTO_EXIT sits after NAME (canonical position), not last.
+    assert.equal(keysOf(resume.envPrefix)[4], "PI_SUBAGENT_AUTO_EXIT");
   });
 
-  it("pi launch full command snapshot (scrub + cd + env + parts + sentinel)", () => {
-    const dir = mkdtempSync(join(tmpdir(), "phase0-pi-"));
+  it("pi launch plan snapshot (scrub + cd + env + parts + sentinel)", () => {
+    const dir = mkdtempSync(join(tmpdir(), "phase23-pi-"));
     const loadout = {
       agent: FIX.agent,
       toolAllowlist: "read,ask_question",
@@ -327,35 +276,21 @@ describe("Phase 0 — exact command snapshots (byte-identical gate, no source ch
     const taskArg = writeTaskArtifact(dir, FIX.name, fullTask, FIX.artifactTs);
     assert.ok(taskArg.startsWith("@"));
 
-    // Inline parts assembly, verbatim replica of index.ts ~1196-1269
-    // (pi --session + -e subagent-done + sandbox + prompt args).
-    const subagentDonePath = join(getSubagentsDir(), "subagent-done.ts");
-    const parts: string[] = ["pi"];
-    parts.push("--session", shellEscape(FIX.sessionFile));
-    parts.push("-e", shellEscape(subagentDonePath));
-    applySandboxToParts(parts as any, loadout as any, { artifactDir: dir, name: FIX.name });
-    for (const promptArg of buildPiPromptArgs({
+    const plan = buildPiLaunchPlan({
+      sessionFile: FIX.sessionFile,
+      loadout: loadout as any,
+      artifactDir: dir,
+      name: FIX.name,
+      surface: FIX.surface,
+      taskArg,
       effectiveSkills: FIX.skills,
       taskDelivery: "artifact",
-      taskArg,
-    })) {
-      parts.push(shellEscape(promptArg));
-    }
-
-    const envPrefix = inlineLaunchEnv({
-      agentDir: FIX.agentDir,
-      spawnable: FIX.spawnable,
-      grantSpawning: true,
-      agent: FIX.agent,
-      name: FIX.name,
-      autoExit: true,
-      sessionFile: FIX.sessionFile,
       childId: FIX.id,
       activityFile: FIX.activityFile,
-      surface: FIX.surface,
+      autoExit: true,
+      targetCwd: FIX.cwd,
     });
-    const cdPrefix = buildCdPrefix(FIX.cwd);
-    const command = withDoneSentinel(`${SCRUB_PREFIX}${cdPrefix}${envPrefix}${parts.join(" ")}`);
+    const { command } = plan;
 
     // Structural pins: scrub first, cd quoted (space in cwd), sentinel last.
     assert.ok(command.startsWith("unset PI_SUBAGENT_KEEP_TAB; "));
@@ -367,8 +302,10 @@ describe("Phase 0 — exact command snapshots (byte-identical gate, no source ch
     assert.ok(command.includes("--model"));
     assert.ok(command.endsWith("; echo '__SUBAGENT_DONE_'$?'__'"));
 
-    // Exact snapshot: rebuild the expectation literally (same helpers, inline
-    // order) so any order/quoting drift fails byte-identical comparison.
+    // Exact snapshot: same helpers, canonical (unified) env order — the
+    // reviewed diff vs the old inline snapshot is exactly the NAME/AGENT
+    // swap (AGENT now before NAME).
+    const subagentDonePath = join(getSubagentsDir(), "subagent-done.ts");
     const expectedParts: string[] = ["pi"];
     expectedParts.push("--session", shellEscape(FIX.sessionFile));
     expectedParts.push("-e", shellEscape(subagentDonePath));
@@ -376,13 +313,23 @@ describe("Phase 0 — exact command snapshots (byte-identical gate, no source ch
     expectedParts.push("--no-extensions");
     expectedParts.push("--tools", shellEscape("read,ask_question"));
     const expectedPromptArgs = ["", "/skill:s1", taskArg].map((a) => shellEscape(a));
-    const expected =
-      withDoneSentinel(
-        `${SCRUB_PREFIX}${buildCdPrefix(FIX.cwd)}${envPrefix}${[...expectedParts, ...expectedPromptArgs].join(" ")}`,
-      );
+    const expectedEnv = buildEnvPrefix({
+      agentDir: FIX.agentDir,
+      spawnable: FIX.spawnable,
+      agent: FIX.agent,
+      name: FIX.name,
+      sessionFile: FIX.sessionFile,
+      childId: FIX.id,
+      activityFile: FIX.activityFile,
+      surface: FIX.surface,
+      autoExit: true,
+    });
+    const expected = withDoneSentinel(
+      `${SCRUB_PREFIX}${buildCdPrefix(FIX.cwd)}${expectedEnv}${[...expectedParts, ...expectedPromptArgs].join(" ")}`,
+    );
     assert.equal(command, expected);
 
-    // Canonical buildPiParts agrees on this shape (no identity ⇒ no
+    // Plan parts agree with the single-home builder (no identity ⇒ no
     // timestamped sysprompt file, so fully deterministic).
     const canonicalParts = buildPiParts({
       sessionFile: FIX.sessionFile,
@@ -391,10 +338,12 @@ describe("Phase 0 — exact command snapshots (byte-identical gate, no source ch
       name: FIX.name,
       promptArgs: buildPiPromptArgs({ effectiveSkills: FIX.skills, taskDelivery: "artifact", taskArg }),
     });
-    assert.deepEqual(parts, canonicalParts);
+    assert.deepEqual(plan.parts, canonicalParts);
+    assert.equal(plan.cdPrefix, buildCdPrefix(FIX.cwd));
+    assert.equal(plan.scriptFile, scriptPathFor(dir, `w-${FIX.id}.sh`));
   });
 
-  it("claude launch snapshot (command + sentinel + inline preamble verbatim)", () => {
+  it("claude launch snapshot (command + sentinel + unified preamble)", () => {
     const { command: claudeBase, sentinelFile } = buildClaudeCommand({
       id: FIX.id,
       task: FIX.task,
@@ -411,11 +360,12 @@ describe("Phase 0 — exact command snapshots (byte-identical gate, no source ch
     const command = withDoneSentinel(claudeBase);
     assert.ok(command.endsWith("; echo '__SUBAGENT_DONE_'$?'__'"));
 
-    // Inline Claude preamble pinned verbatim (differs from
-    // scriptPreambleFor("launch", …) — backends disagree today).
-    const inline = inlineClaudePreamble(FIX.name, FIX.surface);
-    assert.ok(inline.includes(`# Claude Code subagent launch script for ${FIX.name}`));
-    for (const line of inline.split("\n")) {
+    // T2 unification (reviewed): the Claude path now uses scriptPreambleFor
+    // like the pi path instead of its hand-built 3-liner. Same sink guard
+    // (C1), one format, one place.
+    const pre = scriptPreambleFor("claude-launch", { name: FIX.name, surface: FIX.surface });
+    assert.equal(pre.split("\n")[0], `# Subagent claude-launch script for ${FIX.name}`);
+    for (const line of pre.split("\n")) {
       assert.ok(line.startsWith("#"), `preamble line must stay a comment: ${line}`);
     }
     const canonical = scriptPreambleFor("launch", {
@@ -424,11 +374,10 @@ describe("Phase 0 — exact command snapshots (byte-identical gate, no source ch
       surface: FIX.surface,
     });
     assert.ok(canonical.includes("# Subagent launch script for W"));
-    assert.notEqual(inline.split("\n")[0], canonical.split("\n")[0]);
   });
 
-  it("resume command snapshot (loadout replay, AUTO_EXIT last, no SURFACE)", () => {
-    const dir = mkdtempSync(join(tmpdir(), "phase0-resume-"));
+  it("resume plan snapshot (loadout replay, canonical order with SURFACE)", () => {
+    const dir = mkdtempSync(join(tmpdir(), "phase23-resume-"));
     const sessionPath = FIX.sessionFile;
     const loadout = {
       agent: FIX.agent,
@@ -443,45 +392,53 @@ describe("Phase 0 — exact command snapshots (byte-identical gate, no source ch
       agentDir: FIX.agentDir,
     } as const;
 
-    // Inline resume parts, verbatim replica of index.ts ~2245-2260.
-    const subagentDonePath = join(getSubagentsDir(), "subagent-done.ts");
-    const parts = ["pi", "--session", shellEscape(sessionPath)];
-    parts.push("-e", shellEscape(subagentDonePath));
-    applySandboxToParts(parts as any, loadout as any, { artifactDir: dir, name: FIX.name });
-
-    // Deterministic resume message file (inline pattern, pinned timestamp).
-    const resumeMsgFile = join(dir, "subagent-resume", `w-${FIX.msgTs}.md`);
-    mkdirSync(join(dir, "subagent-resume"), { recursive: true });
-    writeFileSync(resumeMsgFile, "follow up please", "utf8");
-    parts.push(shellEscape(`@${resumeMsgFile}`));
-
-    const resumeEnvPrefix = inlineResumeEnv({
-      agentDir: FIX.agentDir,
-      spawnable: FIX.spawnable,
-      agent: FIX.agent,
-      name: FIX.name,
-      autoExit: true, // resume is always autonomous
+    const plan = buildPiResumePlan({
       sessionPath,
-      childId: "resume1",
+      loadout: loadout as any,
+      artifactDir: dir,
+      name: FIX.name,
+      surface: FIX.surface,
+      id: "resume1",
       activityFile: "/art/activity-resume1.json",
+      message: "follow up please",
+      resumeCwd: FIX.cwd,
+      stamp: 456,
+      msgTimestamp: FIX.msgTs,
     });
-    const resumeCdPrefix = buildCdPrefix(loadout.cwd);
-    const command = withDoneSentinel(
-      `unset PI_SUBAGENT_KEEP_TAB; ${resumeCdPrefix}${resumeEnvPrefix}${parts.join(" ")}`,
-    );
+    const { command } = plan;
 
     assert.ok(command.startsWith("unset PI_SUBAGENT_KEEP_TAB; "));
-    assert.ok(!keysOf(resumeEnvPrefix).includes("PI_SUBAGENT_SURFACE"));
-    assert.equal(keysOf(resumeEnvPrefix).at(-1), "PI_SUBAGENT_AUTO_EXIT");
-    assert.ok(command.includes(shellEscape(`@${resumeMsgFile}`)));
+    // Unified order: SURFACE present (was absent), AUTO_EXIT canonical.
+    assert.deepEqual(keysOf(plan.envPrefix), UNIFIED_ORDER);
+    assert.ok(plan.resumeMsgFile, "expected a resume message file");
+    assert.ok(plan.resumeMsgFile!.endsWith(join("subagent-resume", `w-${FIX.msgTs}.md`)));
+    assert.ok(plan.parts.includes(shellEscape(`@${plan.resumeMsgFile}`)));
+    assert.ok(command.includes(shellEscape(`@${plan.resumeMsgFile}`)));
     assert.ok(command.endsWith("; echo '__SUBAGENT_DONE_'$?'__'"));
+    assert.equal(plan.scriptFile, scriptPathFor(dir, "w-resume-456.sh"));
+    assert.equal(plan.cdPrefix, buildCdPrefix(FIX.cwd));
+
+    // No-message resume sends no @file prompt.
+    const quiet = buildPiResumePlan({
+      sessionPath,
+      loadout: loadout as any,
+      artifactDir: dir,
+      name: FIX.name,
+      surface: FIX.surface,
+      id: "resume2",
+      activityFile: "/art/activity-resume2.json",
+      resumeCwd: FIX.cwd,
+      stamp: 457,
+    });
+    assert.equal(quiet.resumeMsgFile, undefined);
+    assert.ok(!quiet.parts.some((p) => p.includes("subagent-resume")));
 
     // Preamble baseline for the C1 fix (Generated line is time-varying).
     const pre = scriptPreambleFor("resume", {
       name: FIX.name,
       sessionFile: sessionPath,
       surface: FIX.surface,
-      resumeMsgFile,
+      resumeMsgFile: plan.resumeMsgFile,
     });
     const normalized = pre.replace(/^# Generated: .*$/m, "# Generated: <TS>");
     assert.ok(normalized.includes("# Subagent resume script for W"));
@@ -494,7 +451,6 @@ describe("Phase 0 — exact command snapshots (byte-identical gate, no source ch
   it("preamble injection fixed (C1): interpolated newlines stay comments", () => {
     // C1 fix: scriptPreambleFor collapses interior newlines in every
     // interpolated field, so an evil `name` cannot escape the `# …` comment.
-    // (Phase 0 pinned the vulnerable behavior; this asserts the fix.)
     for (const evil of ["a\ntouch /tmp/pwned\n#", "x\ry\n", "ok"]) {
       const pre = scriptPreambleFor("launch", { name: evil, surface: "7" });
       for (const line of pre.split("\n")) {
@@ -511,5 +467,24 @@ describe("Phase 0 — exact command snapshots (byte-identical gate, no source ch
     for (const line of resume.split("\n")) {
       assert.ok(line.startsWith("#"), `resume preamble line must stay a comment: ${line}`);
     }
+  });
+
+  it("S3/S4 timestamps + naming live in single homes", () => {
+    // S3: artifact tags are 19 chars; session filenames are a distinct
+    // 23-char + `Z` shape (not just a different length).
+    assert.equal(timestampTag(new Date("2026-01-02T03:04:05.000Z")), "2026-01-02T03-04-05");
+    assert.equal(timestampTag(new Date("2026-01-02T03:04:05.000Z"), 23), "2026-01-02T03-04-05-000");
+    assert.equal(sessionTimestamp(new Date("2026-01-02T03:04:05.123Z")), "2026-01-02T03-04-05-123Z");
+    // S4: resume/launch filenames route through names.ts (slugify never
+    // returns "", so no call-site `|| "resume"` remains).
+    assert.equal(contextArtifactName("W", "2026-01-02T03-04-05"), "w-2026-01-02T03-04-05.md");
+    assert.equal(resumeScriptName("W", 456), "w-resume-456.sh");
+    assert.equal(launchScriptName("W", "abc123"), "w-abc123.sh");
+    // Helpers write through the same names (pinned timestamps stay exact).
+    const dir = mkdtempSync(join(tmpdir(), "phase23-names-"));
+    const taskArg = writeTaskArtifact(dir, "W", "body", "2026-01-02T03-04-05");
+    assert.equal(taskArg, `@${join(dir, "context", "w-2026-01-02T03-04-05.md")}`);
+    const msgFile = writeResumeMessageFile(dir, "W", "hi", "2026-01-02T03-04-05");
+    assert.equal(msgFile, join(dir, "subagent-resume", "w-2026-01-02T03-04-05.md"));
   });
 });

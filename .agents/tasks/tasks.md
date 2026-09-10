@@ -46,7 +46,7 @@ Work queue for agents. **Read this file first** — it's the single source of tr
 
 ### Phase 5 — Refactor launch unification + results
 
-- [ ] `2026-09-09-refactor-launch-results.md` — T2/T3 single plan pipeline (one env order), S3/S4 + env-contract table, T4 results.ts + resume-catch via notifyError (links: `refactor-suggestions.md` T2–T4, `refactor-suggestions-review.md` T2/T3/D6)
+- [x] `2026-09-09-refactor-launch-results.md` — T2/T3 single plan pipeline (one env order), S3/S4 + env-contract table, T4 results.ts + resume-catch via notifyError (links: `refactor-suggestions.md` T2–T4, `refactor-suggestions-review.md` T2/T3/D6) — done, summary: `2026-09-09-refactor-launch-results_summary.md` (launch 16/16, bugfixes 65/65; full suite 278/282, 4 pre-existing discovery failures only)
 
 ### Phase 6 — Refactor handlers + lifecycle + lazy tail + docs
 

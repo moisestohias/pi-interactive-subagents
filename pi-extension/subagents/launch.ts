@@ -11,7 +11,8 @@ import { dirname, join } from "node:path";
 import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { shellEscape } from "./kitty.ts";
 import { getSubagentsDir } from "./paths.ts";
-import { slugifyName } from "./names.ts";
+import { slugifyName, contextArtifactName, launchScriptName, resumeScriptName } from "./names.ts";
+import { timestampTag } from "./format.ts";
 import { getToolExtensionPath, type SubagentLoadoutShim } from "./launch-types.ts";
 import { SPAWNING_TOOLS } from "./agents.ts";
 import type { SubagentLoadout } from "./session.ts";
@@ -45,8 +46,31 @@ export interface EnvPrefixOpts {
 }
 
 /**
- * Build the `KEY='v' KEY='v' ` env prefix. Key order matches the historical
- * launch path so snapshot tests stay stable; resume uses the same order.
+ * Build the `KEY='v' KEY='v' ` env prefix. Single order shared by launch
+ * and resume (T2/T3 unification): AGENT before NAME, SURFACE last,
+ * AUTO_EXIT after NAME (first-class `autoExit`, never via `extra`).
+ *
+ * PI_SUBAGENT_* contract (M4) — writer → reader → compat:
+ * - PI_CODING_AGENT_DIR … plan (launch: resolved local-or-global; resume:
+ *   loadout snapshot, else current env) → agents.ts:getAgentConfigDir()
+ *   (child resolves same agents/extensions) → additive; absent = default dir.
+ * - PI_SUBAGENT_ALLOWED … plan (launch: pinned list only when spawning is
+ *   granted for a list; resume: loadout.spawnable replay) →
+ *   agents.ts:getSubagentAllowlist() (nested-spawn gate) → additive;
+ *   absent = unrestricted (only reachable with `subagent_agents: true`).
+ * - PI_SUBAGENT_AGENT … plan (launch: params.agent; resume: loadout replay)
+ *   → subagent-done.ts (self-spawn guard) → informational; absent = none.
+ * - PI_SUBAGENT_NAME … plan (unique per spawner session) → subagent-done.ts
+ *   (preamble/comments) + resume addressing → compat: never reuse a live name.
+ * - PI_SUBAGENT_AUTO_EXIT=1 … plan iff the run is autonomous (launch:
+ *   effectiveAutoExit; resume: always) → subagent-done.ts (auto-exit path)
+ *   → additive; absent = keep-open eligible.
+ * - PI_SUBAGENT_SESSION/ID/ACTIVITY_FILE … plan → subagent-done.ts
+ *   (sidecar addressing) → compat: paths, never reused across runs.
+ * - PI_SUBAGENT_SURFACE … plan (launch + resume unified) → write-only
+ *   today (M10: no reader; kept for parity/debugging) → additive.
+ * - Legacy PI_SUBAGENT_KEEP_TAB … never set; scrubbed via SCRUB_PREFIX
+ *   (config.json `tabs.keepOpen` is the sole truth) → removed wire.
  */
 export function buildEnvPrefix(opts: EnvPrefixOpts): string {
   const parts: string[] = [];
@@ -117,7 +141,7 @@ export function applySandboxToParts(
 
   if (loadout.identity) {
     const flag = loadout.systemPromptMode === "replace" ? "--system-prompt" : "--append-system-prompt";
-    const spTimestamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+    const spTimestamp = timestampTag();
     const spSafeName = slugifyName(opts.name);
     const spPath = join(opts.artifactDir, `context/${spSafeName}-sysprompt-${spTimestamp}.md`);
     mkdirSync(dirname(spPath), { recursive: true });
@@ -197,8 +221,9 @@ export function writeTaskArtifact(
   fullTask: string,
   timestamp?: string,
 ): string {
-  const ts = timestamp ?? new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
-  const artifactName = `context/${slugifyName(name)}-${ts}.md`;
+  const ts = timestamp ?? timestampTag();
+  // S4: filename via names.ts (single home; slugify never returns "").
+  const artifactName = `context/${contextArtifactName(name, ts)}`;
   const artifactPath = join(artifactDir, artifactName);
   mkdirSync(dirname(artifactPath), { recursive: true });
   writeFileSync(artifactPath, fullTask, "utf8");
@@ -206,13 +231,15 @@ export function writeTaskArtifact(
 }
 
 /** Write a resume message file; returns its path. */
-export function writeResumeMessageFile(artifactDir: string, name: string, message: string): string {
-  const msgTimestamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
-  const file = join(
-    artifactDir,
-    "subagent-resume",
-    `${slugifyName(name) || "resume"}-${msgTimestamp}.md`,
-  );
+export function writeResumeMessageFile(
+  artifactDir: string,
+  name: string,
+  message: string,
+  msgTimestamp?: string,
+): string {
+  const ts = msgTimestamp ?? timestampTag();
+  // S4: filename via names.ts (single home; slugify never returns "").
+  const file = join(artifactDir, "subagent-resume", contextArtifactName(name, ts));
   mkdirSync(dirname(file), { recursive: true });
   writeFileSync(file, message, "utf8");
   return file;
@@ -242,6 +269,138 @@ export function buildPiParts(opts: PiCommandOpts): string[] {
 
 // NOTE: Claude command assembly lives in cli/claude.ts:buildClaudeCommand
 // (single home, wired by index.ts). Do not add a second builder here.
+
+// ── Unified plan pipeline (T2/T3) ───────────────────────────────────────────
+// One assembly per backend path so launch and resume cannot drift (same
+// sandbox replay, same quoting via shellEscape, same env order per the M4
+// table above). Guards stay in the handlers (kept double-open refusal,
+// stale-sidecar unlink after reservation, loadout refusal, entryCountBefore).
+// Stays in launch.ts (defer the P4 split until the file actually doubles).
+
+export interface PiLaunchPlan {
+  /** Full shell command with DONE sentinel (typed into the tab). */
+  command: string;
+  /** Stable artifact script path (exact invocation preserved for debugging). */
+  scriptFile: string;
+  /** The `KEY='v' … ` env prefix (single order — see buildEnvPrefix). */
+  envPrefix: string;
+  /** Assembled `pi …` parts (unquoted join feeds `command`). */
+  parts: string[];
+  /** `cd … && ` prefix (or ""). */
+  cdPrefix: string;
+}
+
+/**
+ * Build the pi-launch command via the single pipeline. `taskArg` is the
+ * caller-computed prompt target (direct task or `@artifact` from
+ * `writeTaskArtifact`); `autoExit` is the effective decision (not the agent
+ * flag). Side effects: sysprompt persistence via `applySandboxToParts`.
+ */
+export function buildPiLaunchPlan(opts: {
+  sessionFile: string;
+  loadout: SubagentLoadout;
+  artifactDir: string;
+  name: string;
+  surface: string;
+  taskArg: string;
+  effectiveSkills?: string;
+  taskDelivery: "direct" | "artifact";
+  childId: string;
+  activityFile: string;
+  autoExit: boolean;
+  targetCwd: string | null;
+}): PiLaunchPlan {
+  const promptArgs = buildPiPromptArgs({
+    effectiveSkills: opts.effectiveSkills,
+    taskDelivery: opts.taskDelivery,
+    taskArg: opts.taskArg,
+  });
+  const parts = buildPiParts({
+    sessionFile: opts.sessionFile,
+    loadout: opts.loadout,
+    artifactDir: opts.artifactDir,
+    name: opts.name,
+    promptArgs,
+  });
+  const envPrefix = buildEnvPrefix({
+    agentDir: opts.loadout.agentDir,
+    spawnable: opts.loadout.spawnable,
+    agent: opts.loadout.agent,
+    name: opts.name,
+    sessionFile: opts.sessionFile,
+    childId: opts.childId,
+    activityFile: opts.activityFile,
+    surface: opts.surface,
+    autoExit: opts.autoExit,
+  });
+  const cdPrefix = buildCdPrefix(opts.targetCwd);
+  const command = withDoneSentinel(`${SCRUB_PREFIX}${cdPrefix}${envPrefix}${parts.join(" ")}`);
+  const scriptFile = scriptPathFor(opts.artifactDir, launchScriptName(opts.name, opts.childId));
+  return { command, scriptFile, envPrefix, parts, cdPrefix };
+}
+
+export interface PiResumePlan {
+  /** Full shell command with DONE sentinel. */
+  command: string;
+  /** Stable artifact script path. */
+  scriptFile: string;
+  /** Resume message file (`@${file}` is in `parts` when `message` present). */
+  resumeMsgFile?: string;
+  /** Assembled `pi …` parts. */
+  parts: string[];
+  /** The shared env prefix (canonical order, SURFACE included). */
+  envPrefix: string;
+  /** `cd … && ` prefix (or ""). */
+  cdPrefix: string;
+}
+
+/**
+ * Build the pi-resume command via the single pipeline. Resume is always
+ * autonomous (`autoExit: true` first-class, never via `extra`). Side
+ * effects: resume-message file + sysprompt persistence (via sandbox replay).
+ * `stamp`/`msgTimestamp` are test seams (default: live clock).
+ */
+export function buildPiResumePlan(opts: {
+  sessionPath: string;
+  loadout: SubagentLoadout;
+  artifactDir: string;
+  name: string;
+  surface: string;
+  id: string;
+  activityFile: string;
+  message?: string;
+  resumeCwd: string | null;
+  stamp?: number | string;
+  msgTimestamp?: string;
+}): PiResumePlan {
+  let resumeMsgFile: string | undefined;
+  if (opts.message) {
+    resumeMsgFile = writeResumeMessageFile(opts.artifactDir, opts.name, opts.message, opts.msgTimestamp);
+  }
+  // Single-home parts assembly (same builder launch uses — they can't drift).
+  const parts = buildPiParts({
+    sessionFile: opts.sessionPath,
+    loadout: opts.loadout,
+    artifactDir: opts.artifactDir,
+    name: opts.name,
+    promptArgs: resumeMsgFile ? [`@${resumeMsgFile}`] : [],
+  });
+  const envPrefix = buildEnvPrefix({
+    agentDir: opts.loadout.agentDir ?? process.env.PI_CODING_AGENT_DIR ?? null,
+    spawnable: opts.loadout.spawnable,
+    agent: opts.loadout.agent,
+    name: opts.name,
+    sessionFile: opts.sessionPath,
+    childId: opts.id,
+    activityFile: opts.activityFile,
+    surface: opts.surface,
+    autoExit: true,
+  });
+  const cdPrefix = buildCdPrefix(opts.resumeCwd);
+  const command = withDoneSentinel(`${SCRUB_PREFIX}${cdPrefix}${envPrefix}${parts.join(" ")}`);
+  const scriptFile = scriptPathFor(opts.artifactDir, resumeScriptName(opts.name, opts.stamp ?? Date.now()));
+  return { command, scriptFile, resumeMsgFile, parts, envPrefix, cdPrefix };
+}
 
 // Re-export type shim helper for tests that stub tool paths.
 export type { SubagentLoadoutShim };

@@ -27,7 +27,6 @@ import {
   closeSurface,
   closeSurfaceAsync,
   logCorruptDrop,
-  shellEscape,
   readScreen,
   readScreenAsync,
   // L4: `windowExists` (lossy boolean wrapper) is deliberately NOT imported
@@ -37,8 +36,10 @@ import {
 } from "./kitty.ts";
 // Canonical helpers (R1 split, T1a clean names). Pure policy lives in the home
 // module; index.ts imports it directly — no local shadowing wrappers.
-import { getSubagentsDir, getArtifactDir } from "./paths.ts";
-import { slugifyName } from "./names.ts";
+// T2/T3: command assembly lives in launch.ts (single plan pipeline) — index
+// keeps orchestration (paths/surfaces/store) and preamble via the helper.
+import { getArtifactDir } from "./paths.ts";
+import { slugifyName, launchScriptName } from "./names.ts";
 import {
   formatElapsed,
   formatTokens,
@@ -46,6 +47,7 @@ import {
   formatContextUsage,
   formatUsageSegments,
   formatElapsedMMSS,
+  sessionTimestamp,
 } from "./format.ts";
 import {
   resolveKeepDecision,
@@ -66,9 +68,12 @@ import {
   buildPiPromptArgs,
   buildCdPrefix,
   buildEnvPrefix,
+  buildPiLaunchPlan,
+  buildPiResumePlan,
   scriptPreambleFor,
   scriptPathFor,
   withDoneSentinel,
+  writeTaskArtifact,
 } from "./launch.ts";
 import {
   resolveResultPresentation,
@@ -76,6 +81,7 @@ import {
 import { getExtensionConfig, getSafeExtensionConfig, invalidateExtensionConfigCache } from "./config.ts";
 import {
   buildClaudeCommand,
+  cleanupClaudeSentinel,
   copyClaudeSession,
   createClaudeSentinelFile,
 } from "./cli/claude.ts";
@@ -95,6 +101,10 @@ import {
   notifyStatus,
 } from "./notifications.ts";
 import {
+  extractClaudeSummary,
+  piSummaryFromEntries,
+} from "./results.ts";
+import {
   renderSubagentToolCall,
   renderSubagentToolResult,
   renderSubagentsListToolResult,
@@ -106,7 +116,6 @@ import {
 } from "./renderers.ts";
 
 import {
-  findLastAssistantMessage,
   getNewEntries,
   getSessionId,
   readEntriesAfter,
@@ -139,9 +148,6 @@ import {
   type ActivityReadResult,
   type SubagentActivityState,
 } from "./activity.ts";
-
-/** Absolute path to `pi-extension/subagents`. https://github.com/nodejs/node/issues/37845 */
-const SUBAGENTS_DIR = getSubagentsDir();
 
 // Survive /reload: clear timers and abort poll loops from the previous module load.
 // /reload re-imports this file, giving fresh module-level state, but closures from
@@ -1170,7 +1176,8 @@ async function launchSubagent(
   // Generate a deterministic session file path for this subagent.
   // This eliminates race conditions when multiple agents launch simultaneously —
   // each agent knows exactly which file is theirs.
-  const timestamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 23) + "Z";
+  // S3: distinct session-filename shape (23 chars + `Z`), not an artifact tag.
+  const timestamp = sessionTimestamp();
   const uuid = [
     id,
     Math.random().toString(16).slice(2, 10),
@@ -1258,17 +1265,17 @@ async function launchSubagent(
     createClaudeSentinelFile(sentinelFile);
     const command = withDoneSentinel(claudeBase);
 
-    const launchScriptName = `${slugifyName(params.name)}-${id}.sh`;
-    const launchScriptFile = scriptPathFor(artifactDir, launchScriptName);
+    const launchScriptBase = launchScriptName(params.name, id);
+    const launchScriptFile = scriptPathFor(artifactDir, launchScriptBase);
 
     sendLongCommand(surface, command, {
       scriptPath: launchScriptFile,
       cwd: targetCwdForSession ?? null,
-      scriptPreamble: [
-        `# Claude Code subagent launch script for ${params.name}`,
-        `# Generated: ${new Date().toISOString()}`,
-        `# Surface: ${surface}`,
-      ].join("\n"),
+      // T2: both backends via scriptPreambleFor (single home, sink-covered).
+      scriptPreamble: scriptPreambleFor("claude-launch", {
+        name: params.name,
+        surface,
+      }),
     });
 
     const running: RunningSubagent = {
@@ -1296,14 +1303,7 @@ async function launchSubagent(
     return running;
   }
 
-  // ── Pi CLI path ──
-
-  // Build pi command
-  const parts: string[] = ["pi"];
-  parts.push("--session", shellEscape(subagentSessionFile));
-
-  const subagentDonePath = join(SUBAGENTS_DIR, "subagent-done.ts");
-  parts.push("-e", shellEscape(subagentDonePath));
+  // ── Pi CLI path (single plan pipeline — T2) ──
 
   // Resolve the config dir the child sees: a target-local .pi/agent/ wins,
   // else the propagated global dir. Captured once so the launch env and the
@@ -1340,76 +1340,32 @@ async function launchSubagent(
   };
   writeSubagentLoadout(subagentSessionFile, loadout);
 
-  // Apply model, identity, and the default-deny tool/extension restriction via
-  // the shared helper (same code path resume uses — they can't drift).
-  applySandboxToParts(parts, loadout, { artifactDir, name: params.name });
-
-  // Build env prefix: subagent identity + config dir propagation + spawn allowlist
-  const envParts: string[] = [];
-
-  if (resolvedAgentDir) {
-    envParts.push(`PI_CODING_AGENT_DIR=${shellEscape(resolvedAgentDir)}`);
-  }
-
-  // `true` leaves PI_SUBAGENT_ALLOWED unset (child allowlist = unrestricted);
-  // a list pins it. Missing/`false` never reach here (no grant).
-  if (grantSpawning && Array.isArray(agentDefs?.subagentAgents)) {
-    envParts.push(`PI_SUBAGENT_ALLOWED=${shellEscape(agentDefs.subagentAgents.join(","))}`);
-  }
-  envParts.push(`PI_SUBAGENT_NAME=${shellEscape(params.name)}`);
-  if (params.agent) {
-    envParts.push(`PI_SUBAGENT_AGENT=${shellEscape(params.agent)}`);
-  }
-  // Exit/keep encoding (config.json is the sole truth for keepOpen; the legacy
-  // PI_SUBAGENT_KEEP_TAB wire is removed and scrubbed — see command prefix below).
-  // keepOpen=false forces exit even for `auto-exit: false` agents (global precedence).
-  // keepOpen=true delegates to the agent: auto-exit ⇒ close, otherwise stay open + `.done`.
-  // effectiveAutoExit ⇔ !keepSurface ⇔ (!keepOpen || agentAutoExit).
-  if (effectiveAutoExit) {
-    envParts.push(`PI_SUBAGENT_AUTO_EXIT=1`);
-  }
-  envParts.push(`PI_SUBAGENT_SESSION=${shellEscape(subagentSessionFile)}`);
-  envParts.push(`PI_SUBAGENT_ID=${shellEscape(id)}`);
-  envParts.push(`PI_SUBAGENT_ACTIVITY_FILE=${shellEscape(activityFile)}`);
-  envParts.push(`PI_SUBAGENT_SURFACE=${shellEscape(surface)}`);
-  const envPrefix = envParts.join(" ") + " ";
-
   // Pass task and skill prompts to the sub-agent.
   // Only full-context fork mode gets a direct task argument because it already
   // inherits the parent conversation. Blank-session modes use artifact-backed
   // handoff so the wrapper instructions arrive as the initial user message.
-  let taskArg: string;
-  if (launchBehavior.taskDelivery === "direct") {
-    taskArg = fullTask;
-  } else {
-    const timestamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
-    const artifactName = `context/${slugifyName(params.name)}-${timestamp}.md`;
-    const artifactPath = join(artifactDir, artifactName);
-    mkdirSync(dirname(artifactPath), { recursive: true });
-    writeFileSync(artifactPath, fullTask, "utf8");
-    taskArg = `@${artifactPath}`;
-  }
+  // S3/S4: artifact write via the single helper (names.ts filename, format.ts tag).
+  const taskArg =
+    launchBehavior.taskDelivery === "direct"
+      ? fullTask
+      : writeTaskArtifact(artifactDir, params.name, fullTask);
 
-  for (const promptArg of buildPiPromptArgs({
+  // T2: one assembly (env order AGENT-before-NAME per the M4 table; same
+  // sandbox replay, quoting, scrub, cd, sentinel the resume plan uses).
+  const { command, scriptFile: launchScriptFile } = buildPiLaunchPlan({
+    sessionFile: subagentSessionFile,
+    loadout,
+    artifactDir,
+    name: params.name,
+    surface,
+    taskArg,
     effectiveSkills,
     taskDelivery: launchBehavior.taskDelivery,
-    taskArg,
-  })) {
-    parts.push(shellEscape(promptArg));
-  }
-
-  // cd into the subagent cwd (parent session dir by default) before starting pi,
-  // so the child process cwd matches its session placement.
-  const cdPrefix = buildCdPrefix(targetCwdForSession);
-
-  // Scrub the removed legacy wire: a user shell that still exports
-  // PI_SUBAGENT_KEEP_TAB (dotfiles / old sessions) would otherwise leak it
-  // into the child via shell inheritance. config.json stays the sole truth.
-  const scrubPrefix = "unset PI_SUBAGENT_KEEP_TAB; ";
-  const piCommand = scrubPrefix + cdPrefix + envPrefix + parts.join(" ");
-  const command = withDoneSentinel(piCommand);
-  const launchScriptName = `${slugifyName(params.name)}-${id}.sh`;
-  const launchScriptFile = scriptPathFor(artifactDir, launchScriptName);
+    childId: id,
+    activityFile,
+    autoExit: effectiveAutoExit,
+    targetCwd: targetCwdForSession,
+  });
   sendLongCommand(surface, command, {
     scriptPath: launchScriptFile,
     cwd: targetCwdForSession ?? null,
@@ -1681,71 +1637,51 @@ async function watchSubagent(
     const elapsed = Math.floor((Date.now() - startTime) / 1000);
 
     if (running.cli === "claude") {
-      // Claude Code result extraction
-      let summary = "";
-
+      // Claude Code result extraction (wording in results.ts).
+      let sentinelText: string | null = null;
       if (running.sentinelFile) {
         try {
-          summary = readFileSync(running.sentinelFile, "utf-8").trim();
+          const raw = readFileSync(running.sentinelFile, "utf-8").trim();
+          sentinelText = raw ? raw : null;
         } catch {}
       }
+      // N7: async scrape (sync execFileSync would block the extension host).
+      const summary = await extractClaudeSummary({
+        sentinelText,
+        surface,
+        exitCode: result.exitCode,
+        readScreen: readScreenAsync,
+      });
 
-      if (!summary) {
-        // N7: async scrape (sync execFileSync would block the extension host).
-        try {
-          summary = (
-            await readScreenAsync(surface, 200)
-          )
-            .replace(/__SUBAGENT_DONE_\d+__/, "")
-            .trimEnd();
-        } catch {
-          summary = "";
-        }
-      }
-
-      if (!summary) {
-        summary = result.exitCode !== 0
-          ? `Claude Code exited with code ${result.exitCode}`
-          : "Claude Code exited without output";
-      }
-
-      // Copy Claude session transcript
+      // Copy Claude session transcript, then clean the predictable /tmp
+      // sentinel pair via the existing helper (D6: no new cleanup fn) — in
+      // `finally` so a close failure can't leak them (N8).
       let sessionId: string | null = null;
-      if (running.sentinelFile) {
-        sessionId = copyClaudeSession(running.sentinelFile);
-        try { unlinkSync(running.sentinelFile); } catch {}
-        try { unlinkSync(running.sentinelFile + ".transcript"); } catch {}
+      try {
+        if (running.sentinelFile) {
+          sessionId = copyClaudeSession(running.sentinelFile);
+        }
+        await maybeCloseSurfaceAsync(surface, running.keepSurface === true);
+        runningSubagents.delete(running.id);
+        return { name, task, summary, exitCode: result.exitCode, elapsed, surfaceKept: running.keepSurface === true, ...(sessionId ? { claudeSessionId: sessionId } : {}) };
+      } finally {
+        if (running.sentinelFile) cleanupClaudeSentinel(running.sentinelFile);
       }
-
-      await maybeCloseSurfaceAsync(surface, running.keepSurface === true);
-      runningSubagents.delete(running.id);
-
-      return { name, task, summary, exitCode: result.exitCode, elapsed, surfaceKept: running.keepSurface === true, ...(sessionId ? { claudeSessionId: sessionId } : {}) };
     }
 
     // Pi subagent result extraction — Missing #2: a single read via
     // `readEntriesAfter` feeds both the summary and the stats (previously a
     // full parse here plus a second full read+parse in
     // `summarizeSessionStats`, i.e. two sync multi-MB JSON parses per
-    // completion on the extension host).
+    // completion on the extension host). Wording in results.ts (T4).
     let summary: string;
     let stats: SessionStats | null = null;
     if (existsSync(sessionFile)) {
       const read = readEntriesAfter(sessionFile, 0);
       stats = summarizeEntriesStats(read.entries);
-      summary =
-        findLastAssistantMessage(read.entries) ??
-        (result.errorMessage
-          ? `Subagent error: ${result.errorMessage}`
-          : result.exitCode !== 0
-            ? `Sub-agent exited with code ${result.exitCode}`
-            : "Sub-agent exited without output");
+      summary = piSummaryFromEntries(read.entries, { errorMessage: result.errorMessage, exitCode: result.exitCode }, "launch");
     } else {
-      summary = result.errorMessage
-        ? `Subagent error: ${result.errorMessage}`
-        : result.exitCode !== 0
-          ? `Sub-agent exited with code ${result.exitCode}`
-          : "Sub-agent exited without output";
+      summary = piSummaryFromEntries([], { errorMessage: result.errorMessage, exitCode: result.exitCode }, "launch");
     }
 
     const subagentSessionId = existsSync(sessionFile) ? getSessionId(sessionFile) : null;
@@ -1773,15 +1709,9 @@ async function watchSubagent(
       else maybeCloseSurface(surface, running.keepSurface === true);
     } catch {}
     // N8: never leak claude sentinel/.transcript (predictable /tmp names) —
-    // success path unlinks; abort/error must too.
-    if (running.sentinelFile) {
-      try {
-        unlinkSync(running.sentinelFile);
-      } catch {}
-      try {
-        unlinkSync(running.sentinelFile + ".transcript");
-      } catch {}
-    }
+    // success path cleans via cleanupClaudeSentinel in `finally`; aborts and
+    // pre-watch errors clean here through the same helper (D6).
+    if (running.sentinelFile) cleanupClaudeSentinel(running.sentinelFile);
     runningSubagents.delete(running.id);
 
     if (signal.aborted) {
@@ -2565,70 +2495,34 @@ export default function subagentsExtension(pi: ExtensionAPI) {
               }
             }
           }
-        const parts = ["pi", "--session", shellEscape(sessionPath)];
-
-        // Load subagent-done extension so the agent can self-terminate if needed
-        const subagentDonePath = join(SUBAGENTS_DIR, "subagent-done.ts");
-        parts.push("-e", shellEscape(subagentDonePath));
-
         const sessionId = ctx.sessionManager.getSessionId();
         const artifactDir = getArtifactDir(ctx.sessionManager.getSessionDir(), sessionId);
         const activityFile = getSubagentActivityFile(artifactDir, id);
         mkdirSync(dirname(activityFile), { recursive: true });
 
-        // Replay the model, identity, and default-deny tool/extension sandbox.
-        applySandboxToParts(parts, loadout, { artifactDir, name });
-
-        let resumeMsgFile: string | undefined;
-        if (params.message) {
-          const msgTimestamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
-          resumeMsgFile = join(
-            artifactDir,
-            "subagent-resume",
-            `${slugifyName(name) || "resume"}-${msgTimestamp}.md`,
-          );
-          mkdirSync(dirname(resumeMsgFile), { recursive: true });
-          writeFileSync(resumeMsgFile, message, "utf8");
-          parts.push(shellEscape(`@${resumeMsgFile}`));
-        }
-
-        // Build env prefix — replay the snapshot's config dir + spawn whitelist
-        // so the resumed process resolves the same agents/extensions and keeps
-        // the same nested-spawn restriction it originally ran with.
-        const resumeEnvParts: string[] = [];
-        const resumeAgentDir = loadout.agentDir ?? process.env.PI_CODING_AGENT_DIR ?? null;
-        if (resumeAgentDir) {
-          resumeEnvParts.push(`PI_CODING_AGENT_DIR=${shellEscape(resumeAgentDir)}`);
-        }
-        if (loadout.spawnable && loadout.spawnable.length > 0) {
-          resumeEnvParts.push(`PI_SUBAGENT_ALLOWED=${shellEscape(loadout.spawnable.join(","))}`);
-        }
-        if (loadout.agent) {
-          resumeEnvParts.push(`PI_SUBAGENT_AGENT=${shellEscape(loadout.agent)}`);
-        }
-        resumeEnvParts.push(`PI_SUBAGENT_NAME=${shellEscape(name)}`);
-        resumeEnvParts.push(`PI_SUBAGENT_SESSION=${shellEscape(sessionPath)}`);
-        resumeEnvParts.push(`PI_SUBAGENT_ID=${shellEscape(id)}`);
-        resumeEnvParts.push(`PI_SUBAGENT_ACTIVITY_FILE=${shellEscape(activityFile)}`);
-        // Resume is always autonomous (autoExit=true) ⇒ always exits, even when
-        // tabs.keepOpen is true (keep ⇔ keepOpen && !autoExit ⇔ false here).
-        // The legacy PI_SUBAGENT_KEEP_TAB wire is removed; config.json stays truth.
-        if (autoExit) {
-          resumeEnvParts.push(`PI_SUBAGENT_AUTO_EXIT=1`);
-        }
-        const resumeEnvPrefix = resumeEnvParts.join(" ") + " ";
-
         // Resume in the subagent's original cwd so its tools (safe_bash, edits)
         // operate where they did before (pre-cwd-default snapshots with null
         // fall back to the current parent session dir).
         const resumeCwd = loadout.cwd ?? (ctx as unknown as { cwd?: string }).cwd ?? null;
-        const resumeCdPrefix = buildCdPrefix(resumeCwd);
 
-        const command = withDoneSentinel(`unset PI_SUBAGENT_KEEP_TAB; ${resumeCdPrefix}${resumeEnvPrefix}${parts.join(" ")}`);
-        const launchScriptFile = scriptPathFor(
+        // T3: one assembly (same env order/sandbox/scrub/cd/sentinel as launch;
+        // SURFACE now included and AUTO_EXIT in canonical position — reviewed
+        // unification, benign: SURFACE is write-only per M10).
+        const {
+          command,
+          scriptFile: launchScriptFile,
+          resumeMsgFile,
+        } = buildPiResumePlan({
+          sessionPath,
+          loadout,
           artifactDir,
-          `${slugifyName(name) || "resume"}-resume-${Date.now()}.sh`,
-        );
+          name,
+          surface,
+          id,
+          activityFile,
+          message: params.message,
+          resumeCwd,
+        });
           sendLongCommand(surface, command, {
             scriptPath: launchScriptFile,
             cwd: resumeCwd,
@@ -2689,20 +2583,20 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             let summary: string;
             try {
               const allEntries = getNewEntries(sessionPath, entryCountBefore);
-              summary =
-                findLastAssistantMessage(allEntries) ??
-                (result.errorMessage
-                  ? `Subagent error: ${result.errorMessage}`
-                  : result.exitCode !== 0
-                    ? `Resumed session exited with code ${result.exitCode}`
-                    : "Resumed session exited without new output");
+              summary = piSummaryFromEntries(
+                allEntries,
+                { errorMessage: result.errorMessage, exitCode: result.exitCode },
+                "resume",
+              );
             } catch {
               // C4: session-file read failure must not discard a good result.
               summary =
                 result.summary ||
-                (result.errorMessage
-                  ? `Subagent error: ${result.errorMessage}`
-                  : "Resumed session exited without new output");
+                piSummaryFromEntries(
+                  [],
+                  { errorMessage: result.errorMessage, exitCode: result.exitCode },
+                  "resume",
+                );
             }
             if (shouldNotifyResult(result)) {
               try {

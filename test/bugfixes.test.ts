@@ -1072,3 +1072,86 @@ describe("P3 renderers live in renderers.ts (no store/kitty deps)", () => {
     );
   });
 });
+
+// Phase 5 — results.ts (T4): one wording table for launch + resume + claude.
+// New suites import homes directly (M3 rule — no new `__test__` keys).
+describe("T4 summaryFallback wording families", () => {
+  it("entries win, then provider error, then exit code, then quiet default", async () => {
+    const { summaryFallback } = await import("../pi-extension/subagents/results.ts");
+    assert.equal(
+      summaryFallback({ entriesSummary: "did it", errorMessage: "boom", exitCode: 1, label: "launch" }),
+      "did it",
+    );
+    assert.equal(
+      summaryFallback({ entriesSummary: null, errorMessage: "boom", exitCode: 1, label: "launch" }),
+      "Subagent error: boom",
+    );
+    assert.equal(
+      summaryFallback({ entriesSummary: null, exitCode: 3, label: "launch" }),
+      "Sub-agent exited with code 3",
+    );
+    assert.equal(summaryFallback({ entriesSummary: null, exitCode: 0, label: "launch" }), "Sub-agent exited without output");
+  });
+
+  it("preserves the intentional launch-vs-resume-vs-claude distinction", async () => {
+    const { summaryFallback } = await import("../pi-extension/subagents/results.ts");
+    assert.equal(
+      summaryFallback({ entriesSummary: null, exitCode: 2, label: "resume" }),
+      "Resumed session exited with code 2",
+    );
+    assert.equal(
+      summaryFallback({ entriesSummary: null, exitCode: 0, label: "resume" }),
+      "Resumed session exited without new output",
+    );
+    assert.equal(
+      summaryFallback({ entriesSummary: null, exitCode: 2, label: "claude" }),
+      "Claude Code exited with code 2",
+    );
+    assert.equal(
+      summaryFallback({ entriesSummary: null, exitCode: 0, label: "claude" }),
+      "Claude Code exited without output",
+    );
+  });
+});
+
+describe("T4 piSummaryFromEntries + extractClaudeSummary", () => {
+  it("assistant entries win over fallbacks (both labels)", async () => {
+    const { piSummaryFromEntries } = await import("../pi-extension/subagents/results.ts");
+    const entries = [
+      {
+        type: "message",
+        id: "m1",
+        message: { role: "assistant", content: [{ type: "text", text: "hello done" }] },
+      },
+    ] as any;
+    assert.equal(piSummaryFromEntries(entries, { exitCode: 1 }, "launch"), "hello done");
+    assert.equal(piSummaryFromEntries(entries, { exitCode: 1 }, "resume"), "hello done");
+    assert.equal(piSummaryFromEntries([], { errorMessage: "overload", exitCode: 1 }, "resume"), "Subagent error: overload");
+  });
+
+  it("claude prefers sentinel, then screen scrape, then quiet default (reader injected)", async () => {
+    const { extractClaudeSummary } = await import("../pi-extension/subagents/results.ts");
+    const boom = () => Promise.reject(new Error("socket hiccup"));
+    assert.equal(
+      await extractClaudeSummary({ sentinelText: "sentinel says hi", surface: "7", exitCode: 0, readScreen: boom }),
+      "sentinel says hi",
+    );
+    assert.equal(
+      await extractClaudeSummary({
+        sentinelText: null,
+        surface: "7",
+        exitCode: 0,
+        readScreen: async () => "screen text __SUBAGENT_DONE_0__   ",
+      }),
+      "screen text",
+    );
+    assert.equal(
+      await extractClaudeSummary({ sentinelText: null, surface: "7", exitCode: 0, readScreen: boom }),
+      "Claude Code exited without output",
+    );
+    assert.equal(
+      await extractClaudeSummary({ sentinelText: null, surface: "7", exitCode: 3, readScreen: boom }),
+      "Claude Code exited with code 3",
+    );
+  });
+});
