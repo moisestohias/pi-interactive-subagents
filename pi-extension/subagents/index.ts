@@ -1,8 +1,6 @@
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
-import { keyHint } from "@mariozechner/pi-coding-agent";
 import { Type, type Static } from "@sinclair/typebox";
-import { Box, Text, truncateToWidth, visibleWidth } from "@mariozechner/pi-tui";
-import { dirname, join, resolve, basename } from "node:path";
+import { dirname, join, basename } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   readdirSync,
@@ -37,68 +35,75 @@ import {
   // (null) can never prune or report-death a live tab (N3).
   windowExistsOrNull,
 } from "./kitty.ts";
-// Canonical helpers (R1 split). index.ts keeps thin wrappers for test compat
-// while new code imports these modules directly.
-import { getSubagentsDir, getArtifactDir as getArtifactDirCanonical } from "./paths.ts";
+// Canonical helpers (R1 split, T1a clean names). Pure policy lives in the home
+// module; index.ts imports it directly — no local shadowing wrappers.
+import { getSubagentsDir, getArtifactDir } from "./paths.ts";
 import { slugifyName } from "./names.ts";
 import {
-  formatElapsed as formatElapsedCanonical,
-  formatTokens as formatTokensCanonical,
-  contextWindowFor as contextWindowForCanonical,
-  formatContextUsage as formatContextUsageCanonical,
-  formatUsageSegments as formatUsageSegmentsCanonical,
-  formatElapsedMMSS as formatElapsedMMSSCanonical,
+  formatElapsed,
+  formatTokens,
+  contextWindowFor,
+  formatContextUsage,
+  formatUsageSegments,
+  formatElapsedMMSS,
 } from "./format.ts";
 import {
-  resolveKeepDecision as resolveKeepDecisionCanonical,
-  resolveKeepForAgent as resolveKeepForAgentCanonical,
+  resolveKeepDecision,
+  resolveKeepForAgent,
 } from "./keep.ts";
 import {
-  borderLine as borderLineCanonical,
-  borderTop as borderTopCanonical,
-  borderBottom as borderBottomCanonical,
-  widgetIcon as widgetIconCanonical,
-  formatWidgetRightLabel as formatWidgetRightLabelCanonical,
-  renderSubagentWidgetLines as renderWidgetLinesCanonical,
+  borderLine,
+  borderTop,
+  borderBottom,
+  widgetIcon,
+  formatWidgetRightLabel,
+  renderSubagentWidgetLines as renderWidgetLines,
 } from "./widget.ts";
 import {
-  SUBAGENT_CONTROL_TOOLS as SUBAGENT_CONTROL_TOOLS_CANONICAL,
-  DEFAULT_SUBAGENT_TOOLS as DEFAULT_SUBAGENT_TOOLS_CANONICAL,
-  buildSubagentToolAllowlist as buildAllowlistCanonical,
-  applySandboxToParts as applySandboxCanonical,
-  buildPiPromptArgs as buildPiPromptArgsCanonical,
-  buildCdPrefix as buildCdPrefixCanonical,
-  buildEnvPrefix as buildEnvPrefixCanonical,
-  scriptPreambleFor as scriptPreambleForCanonical,
-  scriptPathFor as scriptPathForCanonical,
-  withDoneSentinel as withDoneSentinelCanonical,
+  DEFAULT_SUBAGENT_TOOLS,
+  buildSubagentToolAllowlist,
+  applySandboxToParts,
+  buildPiPromptArgs,
+  buildCdPrefix,
+  buildEnvPrefix,
+  scriptPreambleFor,
+  scriptPathFor,
+  withDoneSentinel,
 } from "./launch.ts";
 import {
-  resolveResultPresentation as resolveResultPresentationCanonical,
-  keptTabSuffix as keptTabSuffixCanonical,
+  resolveResultPresentation,
 } from "./notifications.ts";
 import { getExtensionConfig, getSafeExtensionConfig, invalidateExtensionConfigCache } from "./config.ts";
 import {
-  buildClaudeCommand as buildClaudeCommandCanonical,
-  copyClaudeSession as copyClaudeSessionCanonical,
-  createClaudeSentinelFile as createClaudeSentinelFileCanonical,
+  buildClaudeCommand,
+  copyClaudeSession,
+  createClaudeSentinelFile,
 } from "./cli/claude.ts";
 import {
-  activityLabel as activityLabelCanonical,
-  observeRunningSubagent as observeRunningCanonical,
+  observeRunningSubagent,
 } from "./status-bridge.ts";
 import {
-  SubagentStore as SubagentStoreCanonical,
-  keptKey as keptKeyCanonical,
-  clearKeptSurface as clearKeptSurfaceCanonical,
+  SubagentStore,
+  keptKey,
+  clearKeptSurface,
 } from "./store.ts";
 import {
-  notifyResult as notifyResultCanonical,
-  notifyError as notifyErrorCanonical,
-  notifyKeptTabError as notifyKeptTabErrorCanonical,
-  notifyQuestion as notifyQuestionCanonical,
-  notifyStatus as notifyStatusCanonical,
+  notifyResult,
+  notifyError,
+  notifyKeptTabError,
+  notifyQuestion,
+  notifyStatus,
 } from "./notifications.ts";
+import {
+  renderSubagentToolCall,
+  renderSubagentToolResult,
+  renderSubagentsListToolResult,
+  renderSubagentMessageToolCall,
+  renderSubagentMessageToolResult,
+  renderSubagentResultMessage,
+  renderSubagentStatusMessage,
+  renderSubagentQuestionMessage,
+} from "./renderers.ts";
 
 import {
   findLastAssistantMessage,
@@ -204,29 +209,26 @@ import type {
   ListedAgentDefinition as ListedAgentDefinitionT,
 } from "./agents.ts";
 import {
-  SPAWNING_TOOLS as SPAWNING_TOOLS_CANONICAL,
-  BUILTIN_TOOLS as BUILTIN_TOOLS_CANONICAL,
-  getAgentConfigDir as getAgentConfigDirCanonical,
-  getBundledAgentsDir as getBundledAgentsDirCanonical,
-  getFrontmatterValue as getFrontmatterValueCanonical,
-  parseOptionalBoolean as parseOptionalBooleanCanonical,
-  parseCommaList as parseCommaListCanonical,
-  parseSubagentAgents as parseSubagentAgentsCanonical,
-  canSpawnSubagents as canSpawnSubagentsCanonical,
-  parseSessionMode as parseSessionModeCanonical,
-  parseAgentDefinition as parseAgentDefinitionCanonical,
-  discoverAgentDefinitions as discoverAgentDefinitionsCanonical,
-  resolveSubagentPaths as resolveSubagentPathsCanonical,
-  getDefaultSessionDirFor as getDefaultSessionDirCanonical,
-  resolveEffectiveSessionMode as resolveEffectiveSessionModeCanonical,
-  resolveLaunchBehavior as resolveLaunchBehaviorCanonical,
-  resolveEffectiveInteractive as resolveEffectiveInteractiveCanonical,
-  loadAgentDefaults as loadAgentDefaultsCanonical,
-  getSubagentAllowlist as getSubagentAllowlistCanonical,
-  getToolExtensionPath as getToolExtensionPathCanonical,
+  getAgentConfigDir,
+  getBundledAgentsDir,
+  getFrontmatterValue,
+  parseOptionalBoolean,
+  parseCommaList,
+  parseSubagentAgents,
+  canSpawnSubagents,
+  parseSessionMode,
+  parseAgentDefinition,
+  discoverAgentDefinitions,
+  resolveSubagentPaths,
+  getDefaultSessionDirFor,
+  resolveEffectiveSessionMode,
+  resolveLaunchBehavior,
+  resolveEffectiveInteractive,
+  loadAgentDefaults,
+  getSubagentAllowlist,
+  getToolExtensionPath,
 } from "./agents.ts";
 export { registerToolExtension } from "./agents.ts";
-import { registerToolExtension as registerToolExtensionCanonical } from "./agents.ts";
 
 type SubagentSessionMode = SubagentSessionModeT;
 type AgentSource = AgentSourceT;
@@ -234,139 +236,11 @@ type AgentDefaults = AgentDefaultsT;
 type AgentDefinition = AgentDefinitionT;
 type ListedAgentDefinition = ListedAgentDefinitionT;
 
-const SPAWNING_TOOLS = SPAWNING_TOOLS_CANONICAL;
-const BUILTIN_TOOLS = BUILTIN_TOOLS_CANONICAL;
+// T1a: pure-alias wrappers deleted — call sites use the canonical imports above
+// under clean names (no `*Canonical` scar tissue). `getSubagentAllowlistFresh`
+// is gone too: call sites read `getSubagentAllowlist()` fresh (R10/N1).
 
-function getAgentConfigDir(): string {
-  return getAgentConfigDirCanonical();
-}
-
-function getToolExtensionPath(tool: string): string | undefined {
-  return getToolExtensionPathCanonical(tool);
-}
-
-function getSubagentAllowlistFresh(): Set<string> | null {
-  return getSubagentAllowlistCanonical();
-}
-
-// N1: no frozen allowlist const — every gate reads fresh via
-// getSubagentAllowlistFresh()/getSubagentAllowlistCanonical() (R10).
-
-function getBundledAgentsDir(): string {
-  return getBundledAgentsDirCanonical();
-}
-
-function getFrontmatterValue(frontmatter: string, key: string): string | undefined {
-  return getFrontmatterValueCanonical(frontmatter, key);
-}
-
-function parseOptionalBoolean(value: string | undefined): boolean | undefined {
-  return parseOptionalBooleanCanonical(value);
-}
-
-function parseCommaList(value: string | undefined): string[] | undefined {
-  return parseCommaListCanonical(value);
-}
-
-function parseSubagentAgents(value: string | undefined): boolean | string[] | undefined {
-  return parseSubagentAgentsCanonical(value);
-}
-
-function canSpawnSubagents(agentDefs: AgentDefaults | null | undefined): boolean {
-  return canSpawnSubagentsCanonical(agentDefs);
-}
-
-function parseSessionMode(value: string | undefined): SubagentSessionMode | undefined {
-  return parseSessionModeCanonical(value);
-}
-
-function parseAgentDefinition(content: string, fallbackName: string): AgentDefinition | null {
-  return parseAgentDefinitionCanonical(content, fallbackName) as AgentDefinition | null;
-}
-
-function discoverAgentDefinitions(): ListedAgentDefinition[] {
-  return discoverAgentDefinitionsCanonical() as ListedAgentDefinition[];
-}
-
-function resolveSubagentPaths(
-  params: Static<typeof SubagentParams>,
-  agentDefs: AgentDefaults | null,
-): { effectiveCwd: string | null; localAgentDir: string | null; effectiveAgentDir: string } {
-  return resolveSubagentPathsCanonical(params, agentDefs);
-}
-
-function getDefaultSessionDirFor(cwd: string, agentDir: string): string {
-  return getDefaultSessionDirCanonical(cwd, agentDir);
-}
-
-function resolveEffectiveSessionMode(
-  params: Static<typeof SubagentParams>,
-  agentDefs: AgentDefaults | null,
-): SubagentSessionMode {
-  return resolveEffectiveSessionModeCanonical(params, agentDefs);
-}
-
-function resolveLaunchBehavior(
-  params: Static<typeof SubagentParams>,
-  agentDefs: AgentDefaults | null,
-): {
-  sessionMode: SubagentSessionMode;
-  seededSessionMode: "lineage-only" | "fork" | null;
-  inheritsConversationContext: boolean;
-  taskDelivery: "direct" | "artifact";
-} {
-  return resolveLaunchBehaviorCanonical(params, agentDefs);
-}
-
-function resolveEffectiveInteractive(
-  _params: Static<typeof SubagentParams>,
-  agentDefs: AgentDefaults | null,
-): boolean {
-  return resolveEffectiveInteractiveCanonical(_params, agentDefs);
-}
-
-function loadAgentDefaults(agentName: string): AgentDefaults | null {
-  return loadAgentDefaultsCanonical(agentName);
-}
-
-function formatElapsed(seconds: number): string {
-  return formatElapsedCanonical(seconds);
-}
-
-/** Compact token count: 850, 3.2k, 45k. */
-function formatTokens(n: number): string {
-  return formatTokensCanonical(n);
-}
-
-/**
- * Known context-window sizes by model id substring (canonical table in format.ts).
- */
-function contextWindowFor(model: string | null | undefined): number | undefined {
-  return contextWindowForCanonical(model);
-}
-
-/** Context-usage gauge: "18.0%/200k" when window known, else "37k ctx". */
-function formatContextUsage(tokens: number, contextWindow: number | undefined): string {
-  return formatContextUsageCanonical(tokens, contextWindow);
-}
-
-/**
- * Build the dim usage line for a completed subagent (canonical in format.ts).
- */
-function formatUsageSegments(stats: SessionStats): string[] {
-  return formatUsageSegmentsCanonical(stats);
-}
-
-/** ANSI colors for widget status icons (raw, since the widget bypasses theme). */
-const ICON_GREEN = "\x1b[38;2;126;186;103m";
-const ICON_YELLOW = "\x1b[38;2;214;181;94m";
-const ICON_RED = "\x1b[38;2;224;108;117m";
-const ICON_DIM = "\x1b[38;2;128;128;128m";
-
-/** Map a live status kind to a colored single-char icon (canonical in widget.ts). */
-function widgetIcon(kind: StatusSnapshot["kind"]): string {
-  return widgetIconCanonical(kind);
-}
+// S2: dup ICON_* deleted — canonical source is widget.ts (no local uses remained).
 
 /**
  * Wait long enough for a freshly created pane to finish shell startup.
@@ -408,36 +282,35 @@ function shouldKeepSurface(): boolean {
 
 /** Per-agent keep decision: only keep when config allows AND the agent opts out of auto-exit. */
 function shouldKeepSurfaceFor(autoExit: boolean): boolean {
-  return resolveKeepDecisionCanonical({ keepOpen: getExtensionConfig().tabs.keepOpen === true, autoExit }).keepSurface;
+  return resolveKeepDecision({ keepOpen: getExtensionConfig().tabs.keepOpen === true, autoExit }).keepSurface;
 }
 
 /** Per-agent keep decision from a loaded agent definition (missing def ⇒ autoExit=false). */
 function shouldKeepForAgent(agentDefs: AgentDefaults | null): boolean {
-  return resolveKeepForAgentCanonical(getExtensionConfig().tabs.keepOpen === true, agentDefs).keepSurface;
+  return resolveKeepForAgent(getExtensionConfig().tabs.keepOpen === true, agentDefs).keepSurface;
 }
 
-/** Single-decision helper for new code: returns both keep + auto-exit sides. */
-function resolveKeepDecision(opts: { keepOpen: boolean; autoExit: boolean }): { keepSurface: boolean; effectiveAutoExit: boolean } {
-  return resolveKeepDecisionCanonical(opts);
-}
+// T1a: `resolveKeepDecision` pure-alias wrapper deleted — call sites use the
+// canonical import directly (clean name, no `*Canonical` suffix).
 
 /**
  * Close a finished subagent's tab unless this specific run was kept open.
- * Pass the run's `keepSurface` decision; when omitted, falls back to the
- * global config (legacy call sites / tests).
+ * T1b/S5: `keepSurface` is required — every caller passes the run's own
+ * decision explicitly (zero legacy omitted-arg callers). No silent fallback
+ * to global config that would mask keep/exit bugs. Shared keep decision
+ * for the close pair (M11 single-home).
  */
-/** Shared keep decision for the close pair (M11 single-home). */
-function shouldCloseSurface(keepSurface?: boolean): boolean {
-  return !(keepSurface ?? shouldKeepSurface());
+function shouldCloseSurface(keepSurface: boolean): boolean {
+  return !keepSurface;
 }
 
-function maybeCloseSurface(surface: string, keepSurface?: boolean): void {
+function maybeCloseSurface(surface: string, keepSurface: boolean): void {
   if (!shouldCloseSurface(keepSurface)) return;
   closeSurface(surface);
 }
 
 /** Async `maybeCloseSurface` (M11): adopted on completion paths. */
-async function maybeCloseSurfaceAsync(surface: string, keepSurface?: boolean): Promise<void> {
+async function maybeCloseSurfaceAsync(surface: string, keepSurface: boolean): Promise<void> {
   if (!shouldCloseSurface(keepSurface)) return;
   await closeSurfaceAsync(surface);
 }
@@ -462,54 +335,28 @@ function kittyUnavailableResult() {
   return muxUnavailableResult();
 }
 
-/**
- * Build the internal artifact directory path (canonical in paths.ts).
- */
-function getArtifactDir(sessionDir: string, sessionId: string): string {
-  return getArtifactDirCanonical(sessionDir, sessionId);
-}
-
-// Live config accessors (R10): read fresh per call instead of frozen import-time
-// globals. Legacy lets kept (unread by new code) for compat — refreshed on
-// session_start. Import/refresh never throw (M5): schema errors are logged
-// loudly and surface on the next strict getExtensionConfig() call in a tool
-// path; the framework hooks keep running on last-good/defaults.
-function safeConfigInit(): import("./config.ts").ExtensionConfig {
+// T1a/S1: `getArtifactDir` wrapper deleted — call sites use the canonical
+// import directly. Dead triple cache (`extensionConfig`/`statusConfig`/
+// `tabsConfig` + `safeConfigInit`/`refreshConfigCache`) deleted: every call
+// site already reads `getExtensionConfig()` fresh (R10). `session_start`
+// keeps the invalid-config startup warning via `warnOnInvalidConfig()` below
+// + `invalidateExtensionConfigCache()` (S1 adjustment — pure invalidate
+// preserves refresh but drops the drift surface).
+function warnOnInvalidConfig(): void {
   try {
-    return getExtensionConfig(true);
+    getExtensionConfig(true);
   } catch (err) {
     try {
       console.error(`[subagents] invalid config, using defaults until fixed: ${(err as Error)?.message ?? err}`);
     } catch {}
     invalidateExtensionConfigCache();
-    return { status: { enabled: true, lineLimit: 4 }, tabs: { keepOpen: false } };
   }
 }
 
-let extensionConfig = safeConfigInit();
-let statusConfig = extensionConfig.status;
-let tabsConfig = extensionConfig.tabs;
-
-function refreshConfigCache(): void {
-  const next = safeConfigInit();
-  extensionConfig = next;
-  statusConfig = next.status;
-  tabsConfig = next.tabs;
-}
-
-function formatWidgetRightLabel(snapshot: StatusSnapshot): string {
-  return formatWidgetRightLabelCanonical(snapshot);
-}
-
-function resolveResultPresentation(
-  result: Pick<
-    SubagentResult,
-    "exitCode" | "elapsed" | "summary" | "sessionFile" | "sessionId" | "errorMessage"
-  >,
-  name: string,
-): string {
-  return resolveResultPresentationCanonical(result, name);
-}
+// T1b: `formatWidgetRightLabel` dropping wrapper deleted — call sites (and
+// `__test__`) use the canonical with its full 2nd `opts` (cli/statusEnabled)
+// so the claude `running…` label is never silently lost.
+// T1a: `resolveResultPresentation` wrapper deleted — canonical used directly.
 
 /**
  * Result from running a single subagent.
@@ -583,7 +430,7 @@ interface RunningSubagent {
 }
 
 /** All currently running subagents, keyed by id (backed by SubagentStore — R6). */
-const subagentStore = new SubagentStoreCanonical();
+const subagentStore = new SubagentStore();
 const runningSubagents = subagentStore.running as unknown as Map<string, RunningSubagent>;
 
 /**
@@ -608,28 +455,21 @@ interface KeptTab {
 }
 const keptTabs = subagentStore.kept as unknown as Map<string, KeptTab>;
 
-function keptKey(artifactDir: string, name: string): string {
-  return keptKeyCanonical(artifactDir, name);
-}
+// T1a: `keptKey` pure wrapper deleted — canonical `keptKey` from store.ts used
+// directly (clean name, no `*Canonical` suffix).
 
-/** Find a kept tab for this spawner session by name (prunes it if its tab died). */
-function keptTabAlive(surface: string): boolean {
-  // N3: control-plane unknown (null) reads as alive — never prune/report-dead
-  // on a socket hiccup.
-  try {
-    return windowExistsOrNull(surface) !== false;
-  } catch {
-    return true;
-  }
-}
-
+// T1b/S5: `keptTabAlive` wrapper deleted — the N3 default
+// (`windowExistsOrNull(s) !== false`, unknown ⇒ alive) lives in
+// `store.ts:findKept`. This adapter only preserves the index-side cast.
 function findKeptTab(
   artifactDir: string,
   name: string,
-  exists: (surface: string) => boolean = keptTabAlive,
+  exists?: (surface: string) => boolean,
 ): KeptTab | null {
   // Canonical prune+clear lives in store.ts (single implementation).
-  const found = subagentStore.findKept(artifactDir, name, exists);
+  const found = exists === undefined
+    ? subagentStore.findKept(artifactDir, name)
+    : subagentStore.findKept(artifactDir, name, exists);
   return found as unknown as KeptTab | null;
 }
 
@@ -664,7 +504,7 @@ async function monitorKeptTab(kept: KeptTab, piInstance: ExtensionAPI): Promise<
       // silent close (the result was already delivered) — only genuine
       // agent-loop errors (`.exit`) notify.
       try {
-        notifyKeptTabErrorCanonical(piInstance as any, kept.name, result.errorMessage ?? "unknown");
+        notifyKeptTabError(piInstance as any, kept.name, result.errorMessage ?? "unknown");
       } catch {
         // Best effort — the error is also visible in the kept tab itself.
       }
@@ -674,7 +514,7 @@ async function monitorKeptTab(kept: KeptTab, piInstance: ExtensionAPI): Promise<
     // Aborts (shutdown/reload) and poll failures end the monitor quietly.
   } finally {
     subagentStore.untrackKept(kept.parentArtifactDir, kept.name);
-    clearKeptSurfaceCanonical(kept.parentArtifactDir, kept.name, kept);
+    clearKeptSurface(kept.parentArtifactDir, kept.name, kept);
   }
 }
 
@@ -819,7 +659,7 @@ function resurrectRunningTab(
   }
   const action = decideResurrectAction({
     tracked: !!subagentStore.findRunningBySessionFile(sessionPath),
-    kept: subagentStore.kept.has(keptKeyCanonical(artifactDir, regName)),
+    kept: subagentStore.kept.has(keptKey(artifactDir, regName)),
     alive,
   });
   if (action === "skip") return false;
@@ -890,7 +730,7 @@ function resurrectRunningTab(
       // into a dead session; teardown races never reject unhandled.
       if (shouldNotifyResult(result)) {
         try {
-          notifyResultCanonical(piInstance as any, {
+          notifyResult(piInstance as any, {
             name: regName,
             task: running.task,
             agent: running.agent,
@@ -908,7 +748,7 @@ function resurrectRunningTab(
     .catch((err) => {
       updateWidget();
       try {
-        notifyErrorCanonical(piInstance as any, regName, running.task, err);
+        notifyError(piInstance as any, regName, running.task, err);
       } catch {}
     });
   return true;
@@ -944,35 +784,14 @@ let widgetInterval: ReturnType<typeof setInterval> | null = null;
 /** Interval timer for status transition checks. */
 let statusInterval: ReturnType<typeof setInterval> | null = null;
 
-function formatElapsedMMSS(startTime: number): string {
-  return formatElapsedMMSSCanonical(startTime);
-}
+// S2: dup ACCENT/RST deleted — canonical source is widget.ts (no local uses remained).
+// T1a: `formatElapsedMMSS`/`border*`/`widgetIcon` wrappers deleted — canonicals used directly.
 
-const ACCENT = "\x1b[38;2;77;163;255m";
-const RST = "\x1b[0m";
-
-/**
- * Build a bordered content line (canonical in widget.ts).
- */
-function borderLine(left: string, right: string, width: number): string {
-  return borderLineCanonical(left, right, width);
-}
-
-/**
- * Build the bordered top line (canonical in widget.ts).
- */
-function borderTop(title: string, info: string, width: number): string {
-  return borderTopCanonical(title, info, width);
-}
-
-/**
- * Build the bordered bottom line (canonical in widget.ts).
- */
-function borderBottom(width: number): string {
-  return borderBottomCanonical(width);
-}
-
-function renderSubagentWidgetLines(agents: RunningSubagent[], width: number): string[] {
+// T1b: RunningSubagent→WidgetRow adapter (real logic: map + `status.enabled`
+// inject). Renamed to avoid shadowing `widget.ts:renderSubagentWidgetLines`
+// (acceptance: no local `function` shadows a home-module export). `__test__`
+// keeps the old key, re-pointed at this adapter (no test changes).
+function renderRunningWidgetLines(agents: RunningSubagent[], width: number): string[] {
   const now = Date.now();
   const rows = agents.map((agent) => ({
     name: agent.name,
@@ -981,7 +800,7 @@ function renderSubagentWidgetLines(agents: RunningSubagent[], width: number): st
     cli: agent.cli,
     snapshot: classifyStatus(agent.statusState, now),
   }));
-  return renderWidgetLinesCanonical(rows, width, { statusEnabled: getSafeExtensionConfig().status.enabled });
+  return renderWidgetLines(rows, width, { statusEnabled: getSafeExtensionConfig().status.enabled });
 }
 
 function updateWidget() {
@@ -1013,7 +832,7 @@ function updateWidget() {
           return {
             invalidate() {},
             render(width: number) {
-              return renderSubagentWidgetLines(Array.from(runningSubagents.values()), width);
+              return renderRunningWidgetLines(Array.from(runningSubagents.values()), width);
             },
           };
         },
@@ -1035,46 +854,12 @@ function updateWidget() {
  * first positional message so that /skill: args land in messages[1..] and arrive
  * as standalone prompts in the child session.
  */
-// Canonical tool baselines live in launch.ts (single home — N11).
-const DEFAULT_SUBAGENT_TOOLS = DEFAULT_SUBAGENT_TOOLS_CANONICAL;
-void SUBAGENT_CONTROL_TOOLS_CANONICAL;
-
-/**
- * Build the child --tools allowlist (canonical in launch.ts).
- */
-function buildSubagentToolAllowlist(
-  effectiveTools?: string,
-  opts?: { grantSpawning?: boolean },
-): string | null {
-  return buildAllowlistCanonical(effectiveTools, { ...opts, spawningTools: SPAWNING_TOOLS });
-}
-
-/**
- * Apply a loadout snapshot's sandbox (canonical in launch.ts).
- */
-function applySandboxToParts(
-  parts: string[],
-  loadout: SubagentLoadout,
-  opts: { artifactDir: string; name: string },
-): void {
-  return applySandboxCanonical(parts, loadout, opts);
-}
-
-function buildPiPromptArgs(params: {
-  effectiveSkills?: string;
-  taskDelivery: "direct" | "artifact";
-  taskArg: string;
-}): string[] {
-  return buildPiPromptArgsCanonical(params);
-}
-
-function activityLabel(activity: SubagentActivityState): string | undefined {
-  return activityLabelCanonical(activity);
-}
-
-function observeRunningSubagent(running: RunningSubagent, observedAt = Date.now()) {
-  return observeRunningCanonical(running as any, observedAt);
-}
+// T1b/S12: `buildSubagentToolAllowlist` wrapper deleted — the `spawningTools`
+// default now lives in `launch.ts` (imports SPAWNING_TOOLS from agents.ts),
+// so the canonical is used directly. `DEFAULT_SUBAGENT_TOOLS` void-alias
+// deleted — canonical imported clean. `applySandboxToParts`/`buildPiPromptArgs`
+// pure wrappers deleted — canonicals used directly. `activityLabel` dead
+// wrapper deleted (no call sites; bridge owns it).
 
 /**
  * Names claimed by spawns that are mid-launch but not yet registered in
@@ -1259,7 +1044,7 @@ function startStatusRefresh(pi: ExtensionAPI) {
     if (transitionLines.length > 0) {
       const lineLimit = getSafeExtensionConfig().status.lineLimit;
       const capped = capStatusLines(transitionLines, lineLimit);
-      notifyStatusCanonical(pi as any, {
+      notifyStatus(pi as any, {
         content: formatStatusAggregate(transitionLines, lineLimit),
         visibleLines: capped.visibleLines,
         overflow: capped.overflow,
@@ -1285,7 +1070,9 @@ export const __test__ = {
   shouldKeepSurfaceFor,
   shouldKeepForAgent,
   resolveKeepDecision,
-  renderSubagentWidgetLines,
+  // T1b: old key intact, re-pointed at the renamed RunningSubagent adapter
+  // (no test changes; `test/test.ts` imports only via `__test__`).
+  renderSubagentWidgetLines: renderRunningWidgetLines,
   loadAgentDefaults,
   discoverAgentDefinitions,
   resolveEffectiveSessionMode,
@@ -1297,9 +1084,9 @@ export const __test__ = {
   buildSubagentToolAllowlist,
   applySandboxToParts,
   buildPiPromptArgs,
-  buildCdPrefix: buildCdPrefixCanonical,
-  buildEnvPrefix: buildEnvPrefixCanonical,
-  scriptPreambleFor: scriptPreambleForCanonical,
+  buildCdPrefix,
+  buildEnvPrefix,
+  scriptPreambleFor,
   slugifyName,
   formatWidgetRightLabel,
   observeRunningSubagent,
@@ -1452,7 +1239,7 @@ async function launchSubagent(
     : `${roleBlock}\n\n${modeHint}\n\n${params.task}\n\n${summaryInstruction}`;
   // Per-run exit/keep decision (config.json × agent frontmatter, canonical in keep.ts).
   const agentAutoExit = agentDefs?.autoExit ?? false;
-  const { keepSurface, effectiveAutoExit } = resolveKeepDecisionCanonical({
+  const { keepSurface, effectiveAutoExit } = resolveKeepDecision({
     keepOpen: getExtensionConfig().tabs.keepOpen === true,
     autoExit: agentAutoExit,
   });
@@ -1460,7 +1247,7 @@ async function launchSubagent(
   if (agentDefs?.cli === "claude") {
     // Always pass the task as the prompt — even for resumed sessions,
     // the caller's task is the follow-up instruction.
-    const { command: claudeBase, sentinelFile } = buildClaudeCommandCanonical({
+    const { command: claudeBase, sentinelFile } = buildClaudeCommand({
       id,
       task: params.task,
       model: effectiveModel ?? null,
@@ -1468,11 +1255,11 @@ async function launchSubagent(
       cwd: targetCwdForSession ?? null,
     });
     // L8: pre-create the sentinel mode 0600 (predictable /tmp name).
-    createClaudeSentinelFileCanonical(sentinelFile);
-    const command = withDoneSentinelCanonical(claudeBase);
+    createClaudeSentinelFile(sentinelFile);
+    const command = withDoneSentinel(claudeBase);
 
     const launchScriptName = `${slugifyName(params.name)}-${id}.sh`;
-    const launchScriptFile = scriptPathForCanonical(artifactDir, launchScriptName);
+    const launchScriptFile = scriptPathFor(artifactDir, launchScriptName);
 
     sendLongCommand(surface, command, {
       scriptPath: launchScriptFile,
@@ -1613,20 +1400,20 @@ async function launchSubagent(
 
   // cd into the subagent cwd (parent session dir by default) before starting pi,
   // so the child process cwd matches its session placement.
-  const cdPrefix = buildCdPrefixCanonical(targetCwdForSession);
+  const cdPrefix = buildCdPrefix(targetCwdForSession);
 
   // Scrub the removed legacy wire: a user shell that still exports
   // PI_SUBAGENT_KEEP_TAB (dotfiles / old sessions) would otherwise leak it
   // into the child via shell inheritance. config.json stays the sole truth.
   const scrubPrefix = "unset PI_SUBAGENT_KEEP_TAB; ";
   const piCommand = scrubPrefix + cdPrefix + envPrefix + parts.join(" ");
-  const command = withDoneSentinelCanonical(piCommand);
+  const command = withDoneSentinel(piCommand);
   const launchScriptName = `${slugifyName(params.name)}-${id}.sh`;
-  const launchScriptFile = scriptPathForCanonical(artifactDir, launchScriptName);
+  const launchScriptFile = scriptPathFor(artifactDir, launchScriptName);
   sendLongCommand(surface, command, {
     scriptPath: launchScriptFile,
     cwd: targetCwdForSession ?? null,
-    scriptPreamble: scriptPreambleForCanonical("launch", {
+    scriptPreamble: scriptPreambleFor("launch", {
       name: params.name,
       sessionFile: subagentSessionFile,
       surface,
@@ -1667,10 +1454,7 @@ async function launchSubagent(
  * and removes the entry from runningSubagents.
  */
 // N16: session dir owned by cli/claude.ts (os.homedir-based). No local copy.
-
-function copyClaudeSession(sentinelFile: string): string | null {
-  return copyClaudeSessionCanonical(sentinelFile);
-}
+// T1a: `copyClaudeSession` wrapper deleted — canonical used directly.
 
 /**
  * Detect an `ask_question` signal from a still-running subagent and notify the
@@ -1854,7 +1638,7 @@ function deliverPendingQuestion(running: QuestionCarrier, piInstance?: Extension
   const elapsed = Math.floor((Date.now() - running.startTime) / 1000);
 
   try {
-    notifyQuestionCanonical(target as any, {
+    notifyQuestion(target as any, {
       name,
       agent: running.agent,
       sessionId,
@@ -1933,7 +1717,7 @@ async function watchSubagent(
         try { unlinkSync(running.sentinelFile + ".transcript"); } catch {}
       }
 
-      await maybeCloseSurfaceAsync(surface, running.keepSurface);
+      await maybeCloseSurfaceAsync(surface, running.keepSurface === true);
       runningSubagents.delete(running.id);
 
       return { name, task, summary, exitCode: result.exitCode, elapsed, surfaceKept: running.keepSurface === true, ...(sessionId ? { claudeSessionId: sessionId } : {}) };
@@ -1966,7 +1750,7 @@ async function watchSubagent(
 
     const subagentSessionId = existsSync(sessionFile) ? getSessionId(sessionFile) : null;
 
-    await maybeCloseSurfaceAsync(surface, running.keepSurface);
+    await maybeCloseSurfaceAsync(surface, running.keepSurface === true);
     runningSubagents.delete(running.id);
 
     return {
@@ -1986,7 +1770,7 @@ async function watchSubagent(
       // Aborts mean this session is going away (shutdown/reload) — always
       // clean up. Genuine errors honor this run's keep decision for inspection.
       if (signal.aborted) closeSurface(surface);
-      else maybeCloseSurface(surface, running.keepSurface);
+      else maybeCloseSurface(surface, running.keepSurface === true);
     } catch {}
     // N8: never leak claude sentinel/.transcript (predictable /tmp names) —
     // success path unlinks; abort/error must too.
@@ -2027,7 +1811,9 @@ export default function subagentsExtension(pi: ExtensionAPI) {
   // Capture the UI context for widget updates
   pi.on("session_start", (_event, ctx) => {
     latestCtx = ctx;
-    refreshConfigCache();
+    // S1: refresh via invalidate + startup warning (no dead triple cache).
+    invalidateExtensionConfigCache();
+    warnOnInvalidConfig();
     // H4: remember this session's UI context for widget fan-out (and forget
     // it on shutdown) instead of rendering only into the latest session.
     try {
@@ -2066,7 +1852,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             if (keptTabs.has(keptKey(artifactDir, regName))) continue;
             let alive = false;
             try {
-              alive = existsSync(sf) && keptTabAlive(surf);
+              // S5: N3 probe inline (keptTabAlive wrapper deleted; default lives in store.ts).
+              alive = existsSync(sf) && windowExistsOrNull(surf) !== false;
             } catch {
               alive = true; // unknown — keep the monitor, don't orphan the tab
             }
@@ -2241,7 +2028,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         // top-level `fork: true` clone, which has no role and inherits the
         // caller's own already-trusted toolset. Without this guard a missing or
         // unknown `agent` silently launches an unrestricted, full-toolset child.
-        const freshAllowlist = getSubagentAllowlistFresh();
+        const freshAllowlist = getSubagentAllowlist();
         const permittedAgents = freshAllowlist
           ? [...freshAllowlist]
           : discoverAgentDefinitions().map((a) => a.name);
@@ -2420,7 +2207,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
             if (shouldNotifyResult(result)) {
               try {
-                notifyResultCanonical(pi as any, {
+                notifyResult(pi as any, {
                   name: running.name,
                   task: running.task,
                   agent: running.agent,
@@ -2442,7 +2229,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           .catch((err) => {
             updateWidget();
             try {
-              notifyErrorCanonical(pi as any, running.name, running.task, err);
+              notifyError(pi as any, running.name, running.task, err);
             } catch {
               // Teardown races sendMessage — never reject unhandled.
             }
@@ -2475,65 +2262,10 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         };
       },
 
-      renderCall(args, theme) {
-        const partialArgs = args as Record<string, unknown>;
-        const agentName =
-          typeof partialArgs.agent === "string" && partialArgs.agent ? partialArgs.agent : "";
-        const name =
-          typeof partialArgs.name === "string" && partialArgs.name
-            ? partialArgs.name
-            : agentName || "(unnamed)";
-        const task = typeof partialArgs.task === "string" ? partialArgs.task : "";
-        // Only show the agent tag separately when a distinct cosmetic name was given.
-        const agent =
-          agentName && name !== agentName ? theme.fg("dim", ` (${agentName})`) : "";
-        const cwdHint = typeof partialArgs.cwd === "string" && partialArgs.cwd
-          ? theme.fg("dim", ` in ${partialArgs.cwd}`)
-          : "";
-        let text =
-          "○ " +
-          theme.fg("toolTitle", theme.bold(name)) +
-          agent +
-          cwdHint;
+      // P3: presentation lives in renderers.ts (single home).
+      renderCall: renderSubagentToolCall,
 
-        // Show a one-line task preview. renderCall is called repeatedly as the
-        // LLM generates tool arguments, so args.task grows token by token.
-        // We keep it compact here — Ctrl+O on renderResult expands the full content.
-        if (task) {
-          const firstLine = task.split("\n").find((l: string) => l.trim()) ?? "";
-          const preview = firstLine.length > 100 ? firstLine.slice(0, 100) + "…" : firstLine;
-          if (preview) {
-            text += "\n" + theme.fg("toolOutput", preview);
-          }
-          const totalLines = task.split("\n").length;
-          if (totalLines > 1) {
-            text += theme.fg("muted", ` (${totalLines} lines)`);
-          }
-        }
-
-        return new Text(text, 0, 0);
-      },
-
-      renderResult(result, _opts, theme) {
-        const details = result.details as any;
-        const name = details?.name ?? "(unnamed)";
-
-        // "Started" result — tool returned immediately
-        if (details?.status === "started") {
-          return new Text(
-            theme.fg("accent", "⟳") +
-              " " +
-              theme.fg("toolTitle", theme.bold(name)) +
-              theme.fg("dim", " — started"),
-            0,
-            0,
-          );
-        }
-
-        // Fallback (shouldn't happen)
-        const text = typeof result.content[0]?.text === "string" ? result.content[0].text : "";
-        return new Text(theme.fg("dim", text), 0, 0);
-      },
+      renderResult: renderSubagentToolResult,
     });
 
   // ── subagents_list tool ──
@@ -2573,20 +2305,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         };
       },
 
-      renderResult(result, _opts, theme) {
-        const details = result.details as any;
-        const agents = details?.agents ?? [];
-        if (agents.length === 0) {
-          return new Text(theme.fg("dim", "No subagent definitions found."), 0, 0);
-        }
-        const lines = agents.map((a: any) => {
-          const badge = a.source === "project" ? theme.fg("accent", " (project)") : "";
-          const desc = a.description ? theme.fg("dim", ` — ${a.description}`) : "";
-          const model = a.model ? theme.fg("dim", ` [${a.model}]`) : "";
-          return `  ${theme.fg("toolTitle", theme.bold(a.name))}${badge}${model}${desc}`;
-        });
-        return new Text(lines.join("\n"), 0, 0);
-      },
+      // P3: presentation lives in renderers.ts.
+      renderResult: renderSubagentsListToolResult,
     });
 
 
@@ -2620,44 +2340,11 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         }),
       }),
 
-      renderCall(args, theme) {
-        const target = args.name ?? "(unknown)";
-        return new Text(
-          "○ " + theme.fg("toolTitle", theme.bold(target)) + theme.fg("dim", " — message"),
-          0,
-          0,
-        );
-      },
+      // P3: presentation lives in renderers.ts.
+      renderCall: renderSubagentMessageToolCall,
 
-      renderResult(result, _opts, theme) {
-        const details = result.details as any;
-
-        if (details?.status === "steered") {
-          return new Text(
-            theme.fg("success", "✓") +
-              " " +
-              theme.fg("toolTitle", theme.bold(details.name ?? "subagent")) +
-              theme.fg("dim", " — message delivered"),
-            0,
-            0,
-          );
-        }
-
-        if (details?.status === "started") {
-          return new Text(
-            theme.fg("accent", "⟳") +
-              " " +
-              theme.fg("toolTitle", theme.bold(details.name ?? "Resume")) +
-              theme.fg("dim", " — resumed"),
-            0,
-            0,
-          );
-        }
-
-        // Fallback / error
-        const text = typeof result.content[0]?.text === "string" ? result.content[0].text : "";
-        return new Text(theme.fg("dim", text), 0, 0);
-      },
+      // P3: presentation lives in renderers.ts.
+      renderResult: renderSubagentMessageToolResult,
 
       async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
         const requestedName = params.name?.trim();
@@ -2751,11 +2438,13 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
         // Guard: never resume a session that is still running — two processes
         // mutating the same .jsonl corrupts it. Steer it by name instead.
-        for (const r of runningSubagents.values()) {
-          if (resolve(r.sessionFile) === resolve(sessionPath)) {
-            const err = `Subagent "${requestedName}" is still running as "${r.name}". Your message will steer it; resending as a steer.`;
+        // S11: single-home session-file compare (store owns the try/catch).
+        {
+          const live = subagentStore.findRunningBySessionFile(sessionPath) as unknown as RunningSubagent | null;
+          if (live) {
+            const err = `Subagent "${requestedName}" is still running as "${live.name}". Your message will steer it; resending as a steer.`;
             releaseResume();
-            return handleSubagentSteer({ name: r.name, message: params.message });
+            return handleSubagentSteer({ name: live.name, message: params.message });
           }
         }
 
@@ -2843,13 +2532,9 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           // H6 re-check: a concurrent resume may have registered while this
           // call awaited the shell-ready delay. Never double-open one `.jsonl`
           // with two pi processes — steer into the winner instead.
+          // S11: single-home compare via the store (try/catch lives there).
           {
-            let raced: RunningSubagent | null = null;
-            for (const r of runningSubagents.values()) {
-              try {
-                if (resolve(r.sessionFile) === resolve(sessionPath)) { raced = r; break; }
-              } catch { /* ignore unresolvable paths */ }
-            }
+            const raced = subagentStore.findRunningBySessionFile(sessionPath) as unknown as RunningSubagent | null;
             if (raced) {
               closeResumeSurface();
               releaseResume();
@@ -2937,17 +2622,17 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         // operate where they did before (pre-cwd-default snapshots with null
         // fall back to the current parent session dir).
         const resumeCwd = loadout.cwd ?? (ctx as unknown as { cwd?: string }).cwd ?? null;
-        const resumeCdPrefix = buildCdPrefixCanonical(resumeCwd);
+        const resumeCdPrefix = buildCdPrefix(resumeCwd);
 
-        const command = withDoneSentinelCanonical(`unset PI_SUBAGENT_KEEP_TAB; ${resumeCdPrefix}${resumeEnvPrefix}${parts.join(" ")}`);
-        const launchScriptFile = scriptPathForCanonical(
+        const command = withDoneSentinel(`unset PI_SUBAGENT_KEEP_TAB; ${resumeCdPrefix}${resumeEnvPrefix}${parts.join(" ")}`);
+        const launchScriptFile = scriptPathFor(
           artifactDir,
           `${slugifyName(name) || "resume"}-resume-${Date.now()}.sh`,
         );
           sendLongCommand(surface, command, {
             scriptPath: launchScriptFile,
             cwd: resumeCwd,
-            scriptPreamble: scriptPreambleForCanonical("resume", {
+            scriptPreamble: scriptPreambleFor("resume", {
               name,
               sessionFile: sessionPath,
               surface,
@@ -3021,7 +2706,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             }
             if (shouldNotifyResult(result)) {
               try {
-                notifyResultCanonical(pi as any, {
+                notifyResult(pi as any, {
                   name,
                   task: message,
                   summary,
@@ -3040,7 +2725,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           .catch((err) => {
             updateWidget();
             try {
-              notifyErrorCanonical(pi as any, name, message, err);
+              notifyError(pi as any, name, message, err);
             } catch {
               // Teardown races sendMessage — never reject unhandled.
             }
@@ -3090,181 +2775,13 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     },
   });
 
-  // ── subagent_result message renderer ──
-  pi.registerMessageRenderer("subagent_result", (message, options, theme) => {
-    const details = message.details as any;
-    if (!details) return undefined;
+  // P3/T6: presentation lives in renderers.ts (details.summary first, stripping-fallback for old messages).
+  pi.registerMessageRenderer("subagent_result", renderSubagentResultMessage);
 
-    return {
-      render(width: number): string[] {
-        const name = details.name ?? "subagent";
-        const exitCode = details.exitCode ?? 0;
-        const errorMessage = typeof details.errorMessage === "string" ? details.errorMessage : "";
-        const failed = exitCode !== 0 || !!errorMessage;
-        const elapsed = details.elapsed != null ? formatElapsed(details.elapsed) : "?";
-        const bgFn = failed
-          ? (text: string) => theme.bg("toolErrorBg", text)
-          : (text: string) => theme.bg("toolSuccessBg", text);
-        const stats = (details.stats ?? null) as SessionStats | null;
-        const icon = failed
-          ? theme.fg("error", "✗")
-          : theme.fg("success", "✓");
-        const agentTag = details.agent ? theme.fg("dim", ` (${details.agent})`) : "";
-        const modelTag = stats?.model ? theme.fg("dim", ` (${stats.model})`) : "";
-        const titleSegment = `${icon} ${theme.fg("toolTitle", theme.bold(name))}${agentTag}${modelTag} ${theme.fg("dim", "—")} `;
+  pi.registerMessageRenderer("subagent_status", renderSubagentStatusMessage);
 
-        // Success: icon already conveys "completed", so show "N tools · duration"
-        // like the in-process extension. Failure: surface the failure reason.
-        let header: string;
-        if (failed) {
-          const reason = errorMessage ? "failed (provider/agent error)" : `failed (exit ${exitCode})`;
-          header = `${titleSegment}${theme.fg("error", reason)} ${theme.fg("dim", `· ${elapsed}`)}`;
-        } else {
-          const toolPart = stats ? `${stats.toolCount} tools · ${elapsed}` : elapsed;
-          header = `${titleSegment}${theme.fg("dim", toolPart)}`;
-        }
+  pi.registerMessageRenderer("subagent_question", renderSubagentQuestionMessage);
 
-        // Usage line: ↑in ↓out R… W… $cost · context-gauge (color-coded by %).
-        let usageLine: string | null = null;
-        if (stats) {
-          const segs = formatUsageSegments(stats).map((s) => theme.fg("dim", s));
-          if (stats.contextTokens > 0) {
-            const window = contextWindowFor(stats.model);
-            const ctxStr = formatContextUsage(stats.contextTokens, window);
-            const pct = window ? (stats.contextTokens / window) * 100 : 0;
-            const coloredCtx =
-              pct > 90 ? theme.fg("error", ctxStr) : pct > 70 ? theme.fg("warning", ctxStr) : theme.fg("dim", ctxStr);
-            segs.push(coloredCtx);
-          }
-          if (segs.length > 0) usageLine = segs.join(theme.fg("dim", " "));
-        }
-
-        const rawContent = typeof message.content === "string" ? message.content : "";
-
-        // Clean summary (remove follow-up ref and leading label for display)
-        const summary = rawContent
-          .replace(/\n\nFollow up with subagent_message[\s\S]+$/, "")
-          .replace(`Sub-agent "${name}" completed (${elapsed}).\n\n`, "")
-          .replace(`Sub-agent "${name}" failed (exit code ${exitCode}).\n\n`, "")
-          .replace(
-            new RegExp(
-              `^Sub-agent "${name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}" failed after ${elapsed} \\(provider/agent error — auto-retry exhausted\\)\\.\\n\\n`,
-            ),
-            "",
-          );
-
-        // Build content for the box
-        const contentLines = [header];
-        if (usageLine) contentLines.push(usageLine);
-
-        if (options.expanded) {
-          // Full view: complete summary + session info
-          if (summary) {
-            for (const line of summary.split("\n")) {
-              contentLines.push(line.slice(0, width - 6));
-            }
-          }
-          if (details.name || details.sessionFile) {
-            contentLines.push("");
-            if (details.name) {
-              contentLines.push(
-                theme.fg(
-                  "dim",
-                  `Follow up:  subagent_message({ name: "${details.name}", message: "…" })`,
-                ),
-              );
-            }
-            if (details.sessionFile) {
-              contentLines.push(theme.fg("muted", `Session file: ${details.sessionFile}`));
-            }
-          }
-        } else {
-          // Collapsed: preview + expand hint
-          if (summary) {
-            const previewLines = summary.split("\n").slice(0, 5);
-            for (const line of previewLines) {
-              contentLines.push(theme.fg("dim", line.slice(0, width - 6)));
-            }
-            const totalLines = summary.split("\n").length;
-            if (totalLines > 5) {
-              contentLines.push(theme.fg("muted", `… ${totalLines - 5} more lines`));
-            }
-          }
-          contentLines.push(theme.fg("muted", keyHint("app.tools.expand", "to expand")));
-        }
-
-        // Render via Box for background + padding, with blank line above for separation
-        const box = new Box(1, 1, bgFn);
-        box.addChild(new Text(contentLines.join("\n"), 0, 0));
-        return ["", ...box.render(width)];
-      },
-    };
-  });
-
-  // ── subagent_status message renderer ──
-  pi.registerMessageRenderer("subagent_status", (message, options, theme) => {
-    const details = message.details as any;
-    const lines = Array.isArray(details?.lines) ? details.lines : [];
-    const overflow = typeof details?.overflow === "number" ? details.overflow : 0;
-    if (lines.length === 0 && overflow === 0) return undefined;
-
-    return {
-      render(width: number): string[] {
-        const lineWidth = Math.max(0, width - 6);
-        const contentLines = [
-          `${theme.fg("accent", "•")} ${theme.fg("toolTitle", theme.bold("Subagent status"))}`,
-          ...lines.map((line: string) => theme.fg("dim", truncateToWidth(line, lineWidth))),
-        ];
-
-        if (overflow > 0) {
-          contentLines.push(theme.fg("muted", `+${overflow} more running.`));
-        }
-        if (!options.expanded) {
-          contentLines.push(theme.fg("muted", keyHint("app.tools.expand", "to expand")));
-        }
-
-        const box = new Box(1, 1, (text: string) => theme.bg("customMessageBg", text));
-        box.addChild(new Text(contentLines.join("\n"), 0, 0));
-        return ["", ...box.render(width)];
-      },
-    };
-  });
-
-  // ── subagent_question message renderer ──
-  pi.registerMessageRenderer("subagent_question", (message, options, theme) => {
-    const details = message.details as any;
-    if (!details) return undefined;
-
-    return {
-      render(width: number): string[] {
-        const name = details.name ?? "subagent";
-        const agentTag = details.agent ? theme.fg("dim", ` (${details.agent})`) : "";
-        const bgFn = (text: string) => theme.bg("toolSuccessBg", text);
-
-        const icon = theme.fg("accent", "?");
-        const header = `${icon} ${theme.fg("toolTitle", theme.bold(name))}${agentTag} ${theme.fg("dim", "— asks a question")}`;
-
-        const contentLines = [header];
-
-        if (options.expanded) {
-          contentLines.push("");
-          contentLines.push(details.question ?? "");
-          contentLines.push("");
-          contentLines.push(
-            theme.fg("dim", `Reply: subagent_message({ name: "${name}", message: "…" })`),
-          );
-        } else {
-          const preview = (details.question ?? "").split("\n")[0].slice(0, width - 10);
-          contentLines.push(theme.fg("dim", preview));
-          contentLines.push(theme.fg("muted", keyHint("app.tools.expand", "to expand")));
-        }
-
-        const box = new Box(1, 1, bgFn);
-        box.addChild(new Text(contentLines.join("\n"), 0, 0));
-        return ["", ...box.render(width)];
-      },
-    };
-  });
 
 }
 // test

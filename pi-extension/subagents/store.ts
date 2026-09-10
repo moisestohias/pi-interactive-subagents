@@ -14,6 +14,7 @@ import {
   registerName,
   type NameRegistry,
 } from "./session.ts";
+import { windowExistsOrNull } from "./kitty.ts";
 
 export interface RunningEntry {
   id: string;
@@ -140,11 +141,13 @@ export class SubagentStore {
   /**
    * Find a kept tab, pruning it (and clearing the stale registry surface)
    * when its window is gone. `exists` is injectable for tests.
+   * T1b/S5: defaults to the N3 liveness probe (unknown ⇒ alive) so callers
+   * never need the old `keptTabAlive` wrapper in index.ts.
    */
   findKept(
     artifactDir: string,
     name: string,
-    exists: (surface: string) => boolean,
+    exists: (surface: string) => boolean = (s) => windowExistsOrNull(s) !== false,
   ): KeptTab | null {
     const kept = this.kept.get(keptKey(artifactDir, name));
     if (!kept) return null;

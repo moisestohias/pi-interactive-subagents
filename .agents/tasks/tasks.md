@@ -42,7 +42,7 @@ Work queue for agents. **Read this file first** — it's the single source of tr
 
 ### Phase 4 — Refactor foundation (wrappers, constants, renderers)
 
-- [ ] `2026-09-09-refactor-foundation.md` — T1a/T1b wrapper deletion + adapter relocation (clean names), S1/S2/S5/S11/S12, T6+P3 renderers.ts from details.summary (links: `refactor-suggestions.md` T1/T6/P3, `refactor-suggestions-review.md` T1/T6/P3/S-sections)
+- [x] `2026-09-09-refactor-foundation.md` — T1a/T1b wrapper deletion + adapter relocation (clean names), S1/S2/S5/S11/S12, T6+P3 renderers.ts from details.summary (links: `refactor-suggestions.md` T1/T6/P3, `refactor-suggestions-review.md` T1/T6/P3/S-sections) — done, summary: `2026-09-09-refactor-foundation_summary.md` (index 3270→2786, −484; bugfixes 61/61; full suite 273/277, 4 pre-existing discovery failures only)
 
 ### Phase 5 — Refactor launch unification + results
 

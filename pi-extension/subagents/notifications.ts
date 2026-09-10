@@ -4,6 +4,7 @@
  * Callers pass data only — envelope + customType live here.
  */
 import { formatElapsed } from "./format.ts";
+import { escapeRegExp } from "./agents.ts";
 import type { SessionStats } from "./session.ts";
 
 export interface MinimalPi {
@@ -53,6 +54,33 @@ export function keptTabSuffix(surfaceKept?: boolean): string {
   return surfaceKept ? "\n\n(Kitty tab left open — close it yourself when done.)" : "";
 }
 
+/**
+ * T6: renderer summary source. Prefers structured `details.summary` (added to
+ * `notifyResult`); falls back to stripping the human `content` only for old
+ * persisted messages that predate the field. S9: the fallback reuses the
+ * shared `escapeRegExp` instead of an inline escape.
+ */
+export function summaryForDisplay(
+  details: { name?: unknown; summary?: unknown; elapsed?: unknown; exitCode?: unknown },
+  rawContent: string,
+): string {
+  if (typeof details.summary === "string" && details.summary.length > 0) return details.summary;
+  const name = typeof details.name === "string" ? details.name : "subagent";
+  const elapsed =
+    typeof details.elapsed === "number" ? formatElapsed(details.elapsed) : "?";
+  const exitCode = typeof details.exitCode === "number" ? details.exitCode : 0;
+  return rawContent
+    .replace(/\n\nFollow up with subagent_message[\s\S]+$/, "")
+    .replace(`Sub-agent "${name}" completed (${elapsed}).\n\n`, "")
+    .replace(`Sub-agent "${name}" failed (exit code ${exitCode}).\n\n`, "")
+    .replace(
+      new RegExp(
+        `^Sub-agent "${escapeRegExp(name)}" failed after ${escapeRegExp(elapsed)} \\(provider/agent error — auto-retry exhausted\\)\\.\\n\\n`,
+      ),
+      "",
+    );
+}
+
 export function notifyResult(pi: MinimalPi, result: SubagentResultLike): void {
   const presentation = resolveResultPresentation(result, result.name) + keptTabSuffix(result.surfaceKept);
   pi.sendMessage(
@@ -64,6 +92,8 @@ export function notifyResult(pi: MinimalPi, result: SubagentResultLike): void {
         name: result.name,
         task: result.task,
         agent: result.agent,
+        // T6: structured summary so renderers never parse prose (S9 fallback covers old messages).
+        summary: result.summary,
         exitCode: result.exitCode,
         elapsed: result.elapsed,
         sessionFile: result.sessionFile,

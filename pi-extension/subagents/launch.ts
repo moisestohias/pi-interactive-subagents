@@ -13,6 +13,7 @@ import { shellEscape } from "./kitty.ts";
 import { getSubagentsDir } from "./paths.ts";
 import { slugifyName } from "./names.ts";
 import { getToolExtensionPath, type SubagentLoadoutShim } from "./launch-types.ts";
+import { SPAWNING_TOOLS } from "./agents.ts";
 import type { SubagentLoadout } from "./session.ts";
 
 // ── Small pure helpers ──────────────────────────────────────────────────────
@@ -154,7 +155,9 @@ export function buildSubagentToolAllowlist(
     .filter(Boolean);
 
   const grantSpawning = opts?.grantSpawning ?? false;
-  const spawningTools = opts?.spawningTools ?? ["subagent", "subagent_message", "subagents_list"];
+  // T1b: default spawning set lives with the gate definition in agents.ts
+  // (single home) so the index wrapper's injection can't drift.
+  const spawningTools = opts?.spawningTools ?? SPAWNING_TOOLS;
 
   const base = requested.length > 0 ? requested : [...DEFAULT_SUBAGENT_TOOLS];
 

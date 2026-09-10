@@ -1002,3 +1002,73 @@ describe("L7 artifact sweep", () => {
     }
   });
 });
+
+// Phase 4 — refactor foundation (T1/T6/P3): renderers own presentation,
+// notifications own content. New suites import homes directly (M3 rule —
+// no new `__test__` keys).
+describe("T6 notifyResult carries structured summary", () => {
+  it("details.summary mirrors the result summary", async () => {
+    const { notifyResult, summaryForDisplay } = await import("../pi-extension/subagents/notifications.ts");
+    const seen: any[] = [];
+    const pi = { sendMessage: (m: any, o: any) => void seen.push([m, o]) } as any;
+    notifyResult(pi, { name: "w", summary: "did it", exitCode: 0, elapsed: 5 });
+    assert.equal(seen[0][0].details.summary, "did it");
+    // Renderer source prefers the structured field (no prose parsing).
+    assert.equal(summaryForDisplay(seen[0][0].details, seen[0][0].content), "did it");
+  });
+
+  it("fallback strips old persisted content (incl. special-char names via escapeRegExp)", async () => {
+    const { summaryForDisplay } = await import("../pi-extension/subagents/notifications.ts");
+    const name = 'w.*+?^${}()|[\\]';
+    const elapsed = 5;
+    const { resolveResultPresentation } = await import("../pi-extension/subagents/notifications.ts");
+    const content = resolveResultPresentation({ exitCode: 0, elapsed, summary: "old body" }, name);
+    // Old message: no summary field — stripping must recover the body without throwing on regex chars.
+    assert.equal(summaryForDisplay({ name, elapsed, exitCode: 0 }, content), "old body");
+    // New message wins even when content disagrees (proves no string surgery on the live path).
+    assert.equal(
+      summaryForDisplay({ name, elapsed, exitCode: 0, summary: "new body" }, content),
+      "new body",
+    );
+  });
+});
+
+describe("P3 renderers live in renderers.ts (no store/kitty deps)", () => {
+  it("subagent_result renders from details.summary (byte-identical for success)", async () => {
+    const r = await import("../pi-extension/subagents/renderers.ts");
+    const theme = {
+      fg: (_c: string, t: string) => t,
+      bg: (_c: string, t: string) => t,
+      bold: (t: string) => t,
+    };
+    const details = { name: "w", summary: "did it", exitCode: 0, elapsed: 5 };
+    const { resolveResultPresentation } = await import("../pi-extension/subagents/notifications.ts");
+    const content = resolveResultPresentation({ exitCode: 0, elapsed: 5, summary: "did it" }, "w");
+    const out = r.renderSubagentResultMessage(
+      { customType: "subagent_result", content, details },
+      { expanded: true },
+      theme,
+    )!.render(80).join("\n");
+    assert.match(out, /did it/);
+    assert.match(out, /Follow up/);
+  });
+
+  it("T1b adapters kept: __test__ widget lines + formatWidgetRightLabel opts (claude label)", async () => {
+    // `renderSubagentWidgetLines` key intact, re-pointed at the renamed adapter.
+    const { createStatusState } = await import("../pi-extension/subagents/status.ts");
+    const now = Date.now();
+    const lines = (testApi as any).renderSubagentWidgetLines(
+      [{ id: "a", name: "A", task: "", surface: "1", startTime: now - 1000, sessionFile: "s", statusState: createStatusState({ source: "pi", startTimeMs: now - 1000 }) }],
+      60,
+    );
+    assert.ok(Array.isArray(lines) && lines.length >= 2);
+    // Previously the index wrapper dropped the 2nd `opts` (claude label lost).
+    // The re-pointed canonical must honor it.
+    const { formatWidgetRightLabel } = await import("../pi-extension/subagents/widget.ts");
+    assert.equal((testApi as any).formatWidgetRightLabel({ kind: "starting" } as any), formatWidgetRightLabel({ kind: "starting" } as any));
+    assert.equal(
+      (testApi as any).formatWidgetRightLabel({ kind: "starting" } as any, { statusEnabled: false, cli: "claude" }),
+      " running… ",
+    );
+  });
+});
