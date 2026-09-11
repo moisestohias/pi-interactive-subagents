@@ -96,7 +96,14 @@ export function readJsonClaim<T>(claimPath: string): { ok: true; value: T } | { 
   }
 }
 
-function interpretExitPayload(data: any): TakeSidecarResult {
+/**
+ * Decode an `.exit` sidecar payload (written by the error path in
+ * `subagent-done.ts`). Single home for the decode (rule 1) — kitty's
+ * `interpretExitSidecar` delegates here so the wording (incl. the
+ * stopReason fallback string) cannot drift between the two. Clean
+ * completions write no sidecar and are detected via the terminal sentinel.
+ */
+export function interpretExitPayload(data: any): TakeSidecarResult {
   if (data?.type === "error") {
     const errorMessage =
       typeof data.errorMessage === "string" && data.errorMessage.trim() !== ""

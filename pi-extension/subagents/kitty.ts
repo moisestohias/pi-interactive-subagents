@@ -18,10 +18,10 @@
  */
 import { execFile, execFileSync } from "node:child_process";
 import { promisify } from "node:util";
-import { existsSync, readFileSync, renameSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
+import { existsSync, writeFileSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { takeSidecar } from "./session/sidecars.ts";
+import { takeSidecar, interpretExitPayload } from "./session/sidecars.ts";
 
 const execFileAsync = promisify(execFile);
 
@@ -395,23 +395,18 @@ export interface PollResult {
 }
 
 /**
- * Interpret an `.exit` sidecar payload (written by the error path in
- * subagent-done.ts). Centralized so both the fast and slow paths in
- * pollForExit decode the payload the same way. Clean completions write no
- * sidecar and are detected via the terminal sentinel instead.
+ * Decode an `.exit` sidecar payload for the poll loop. Thin delegation to
+ * the single home (`session/sidecars.ts:interpretExitPayload`, rule 1) —
+ * kept under this name only because `__pollForExitTest__` (and
+ * `test/test.ts` through it) pins the key. Maps the shared result onto
+ * `PollResult` (`tabClosed` is set by the H1 liveness probe, never here).
  *
  * Note: ask_question does NOT write a `.exit` sidecar — it keeps the session
  * open and signals the parent via a separate `.ask` file (see deliverPendingQuestion).
  */
 function interpretExitSidecar(data: any): PollResult {
-  if (data?.type === "error") {
-    const errorMessage =
-      typeof data.errorMessage === "string" && data.errorMessage.trim() !== ""
-        ? data.errorMessage
-        : "Subagent exited with stopReason=error (no errorMessage in sidecar).";
-    return { reason: "error", exitCode: 1, errorMessage };
-  }
-  return { reason: "done", exitCode: 0 };
+  const decoded = interpretExitPayload(data);
+  return { reason: decoded.reason, exitCode: decoded.exitCode, ...(decoded.errorMessage ? { errorMessage: decoded.errorMessage } : {}) };
 }
 
 /**
@@ -435,16 +430,6 @@ export function logCorruptDrop(kind: string, path: string, reason: string): void
 /** Test seam (Missing #4): snapshot of corrupt-drop counters. */
 export function corruptDropCountsForTest(): Record<string, number> {
   return Object.fromEntries(corruptDropCounts.entries());
-}
-
-/**
- * Claim a sidecar file via rename-before-read. Returns the claim path, or
- * null when absent / already claimed by another consumer (race lost).
- * Shared by `.exit` and `.done` so both deliver exactly once (M1).
- * Single home: `session/sidecars.ts:claimFile` (T8).
- */
-function claimSidecarFile(path: string): string | null {
-  return claimFile(path);
 }
 
 /**
