@@ -25,6 +25,8 @@ export interface SubagentLoadout {
   cwd: string | null;
   /** PI_CODING_AGENT_DIR the subagent resolved config from, or null. */
   agentDir: string | null;
+  /** Proposal A opt-in: launch used core `--disable-file-wrapper` for the task artifact. */
+  rawArtifact: boolean;
 }
 
 /** Path of the loadout sidecar written next to a subagent session file. */
@@ -63,6 +65,8 @@ export function isValidSubagentLoadout(value: unknown): value is SubagentLoadout
   if (!(v.spawnable === null || (Array.isArray(v.spawnable) && v.spawnable.every((s) => typeof s === "string"))))
     return false;
   if (typeof v.autoExit !== "boolean") return false;
+  // Proposal A: pre-flag snapshots lack the field — accept undefined (reads as false).
+  if (!(v.rawArtifact === undefined || typeof v.rawArtifact === "boolean")) return false;
   if (!strOrNull("cwd")) return false;
   if (!strOrNull("agentDir")) return false;
   return true;
@@ -75,7 +79,8 @@ export function readSubagentLoadout(sessionFile: string): SubagentLoadout | null
     if (!existsSync(p)) return null;
     const parsed = JSON.parse(readFileSync(p, "utf8"));
     if (!isValidSubagentLoadout(parsed)) return null;
-    return parsed;
+    // Normalize pre-flag snapshots (missing field) to explicit false.
+    return { ...parsed, rawArtifact: (parsed as { rawArtifact?: unknown }).rawArtifact === true };
   } catch {
     return null;
   }

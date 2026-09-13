@@ -27,6 +27,8 @@ export interface AgentDefaults {
    */
   subagentAgents?: boolean | string[];
   autoExit?: boolean;
+  /** Proposal A (`raw-artifact: false` opts out): launch the task artifact with core `--disable-file-wrapper`. Raw delivery is the default — absent frontmatter means raw. */
+  rawArtifact?: boolean;
   interactive?: boolean;
   systemPromptMode?: "append" | "replace";
   sessionMode?: SubagentSessionMode;
@@ -225,6 +227,15 @@ export function canSpawnSubagents(agentDefs: AgentDefaults | null | undefined): 
   return gate === true || (Array.isArray(gate) && gate.length > 0);
 }
 
+/**
+ * Proposal A default: raw task-artifact delivery (core `--disable-file-wrapper`)
+ * is on unless the agent explicitly opts out (`raw-artifact: false`). Absent
+ * frontmatter means raw — the wrapper was never load-bearing for launch.
+ */
+export function resolveRawArtifact(agentDefs: AgentDefaults | null | undefined): boolean {
+  return agentDefs?.rawArtifact ?? true;
+}
+
 export function parseSessionMode(value: string | undefined): SubagentSessionMode | undefined {
   if (value === "standalone" || value === "lineage-only" || value === "fork") {
     return value;
@@ -263,6 +274,7 @@ export function parseAgentDefinition(
     thinking: get("thinking"),
     subagentAgents: parseSubagentAgents(get("subagent_agents")),
     autoExit: parseOptionalBoolean(get("auto-exit")),
+    rawArtifact: parseOptionalBoolean(get("raw-artifact")),
     interactive: parseOptionalBoolean(get("interactive")),
     sessionMode: parseSessionMode(get("session-mode")),
     cwd: get("cwd"),

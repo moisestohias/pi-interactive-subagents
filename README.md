@@ -126,6 +126,7 @@ You are a specialized agent that does X...
 | `session-mode` | string | `standalone` (default), `lineage-only`, or `fork` — see below |
 | `system-prompt` | string | `append` or `replace`: pass the body as the child's `--append-system-prompt` / `--system-prompt`. Omit and the body is prepended to the task prompt instead |
 | `auto-exit` | boolean | Auto-shutdown when the agent finishes (see below) |
+| `raw-artifact` | boolean | Raw task delivery via pi core `--disable-file-wrapper`, so the child receives the task bytes raw with no `<file>` XML wrapper. Raw is the default: omit it (or set `true`) for raw delivery, set `false` to keep the legacy wrapped delivery |
 | `interactive` | boolean | Whether stall/recovery transitions wake the parent (see below) |
 | `cwd` | string | Default working directory |
 | `disable-model-invocation` | boolean | Hide from `subagents_list`; still spawnable by explicit name |

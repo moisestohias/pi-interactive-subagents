@@ -337,6 +337,7 @@ describe("session.ts", () => {
       autoExit: true,
       cwd: "/work/dir",
       agentDir: "/home/u/.pi/agent",
+      rawArtifact: false,
     };
 
     it("writes the sidecar next to the session file", () => {

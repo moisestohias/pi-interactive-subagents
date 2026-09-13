@@ -105,6 +105,7 @@ import {
   getDefaultSessionDirFor,
   resolveSubagentPaths,
   resolveLaunchPolicy,
+  resolveRawArtifact,
   loadAgentDefaults,
   canSpawnSubagents,
 } from "./agents.ts";
@@ -922,6 +923,8 @@ export async function launchSubagent(
     autoExit: agentDefs?.autoExit ?? false,
     cwd: targetCwdForSession ?? null,
     agentDir: resolvedAgentDir,
+    // Proposal A: raw artifact delivery by default; `raw-artifact: false` opts out. Resume replays from this snapshot.
+    rawArtifact: resolveRawArtifact(agentDefs),
   };
   writeSubagentLoadout(subagentSessionFile, loadout);
 
@@ -950,6 +953,7 @@ export async function launchSubagent(
     activityFile,
     autoExit: effectiveAutoExit,
     targetCwd: targetCwdForSession,
+    rawArtifact: loadout.rawArtifact,
   });
   sendLongCommand(surface, command, {
     scriptPath: launchScriptFile,

@@ -439,6 +439,7 @@ export async function executeMessage(
       activityFile,
       message: params.message,
       resumeCwd,
+      rawArtifact: loadout.rawArtifact ?? false,
     });
     sendLongCommand(surface, command, {
       scriptPath: launchScriptFile,

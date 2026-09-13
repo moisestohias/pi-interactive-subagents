@@ -1161,3 +1161,130 @@ describe("T4 piSummaryFromEntries + extractClaudeSummary", () => {
     );
   });
 });
+
+describe("Proposal A raw-artifact (--disable-file-wrapper)", () => {
+  const baseLoadout = {
+    agent: null,
+    toolAllowlist: "read",
+    model: null,
+    thinking: null,
+    systemPromptMode: null,
+    identity: null,
+    spawnable: null,
+    autoExit: false,
+    cwd: null,
+    agentDir: null,
+    rawArtifact: false,
+  };
+
+  it("buildPiParts omits the flag by default, appends it when opted in", async () => {
+    const { buildPiParts } = await import("../pi-extension/subagents/launch.ts");
+    const base = {
+      sessionFile: "/s.jsonl",
+      loadout: baseLoadout,
+      artifactDir: "/art",
+      name: "W",
+      promptArgs: ["@/art/context/w.md"],
+    };
+    const def = buildPiParts(base);
+    assert.ok(!def.includes("--disable-file-wrapper"));
+    const raw = buildPiParts({ ...base, rawArtifact: true });
+    assert.ok(raw.includes("--disable-file-wrapper"));
+    // Flag lands after sandbox, before prompt args (prompt stays last).
+    assert.equal(raw[raw.length - 1], def[def.length - 1]);
+    assert.ok(raw.indexOf("--disable-file-wrapper") < raw.length - 1);
+    assert.ok(raw.length === def.length + 1);
+    // Default output is byte-identical to the pre-flag shape.
+    assert.deepEqual(def, buildPiParts({ ...base, rawArtifact: false }));
+  });
+
+  it("buildPiLaunchPlan/buildPiResumePlan forward rawArtifact; absent means no flag", async () => {
+    const { buildPiLaunchPlan, buildPiResumePlan } =
+      await import("../pi-extension/subagents/launch.ts");
+    const launchDef = buildPiLaunchPlan({
+      sessionFile: "/s.jsonl",
+      loadout: baseLoadout,
+      artifactDir: "/art",
+      name: "W",
+      surface: "7",
+      taskArg: "@/art/context/w.md",
+      taskDelivery: "artifact",
+      childId: "id1",
+      activityFile: "/a.json",
+      autoExit: false,
+      targetCwd: null,
+    });
+    assert.ok(!launchDef.command.includes("--disable-file-wrapper"));
+    const launchRaw = buildPiLaunchPlan({
+      sessionFile: "/s.jsonl",
+      loadout: { ...baseLoadout, rawArtifact: true },
+      artifactDir: "/art",
+      name: "W",
+      surface: "7",
+      taskArg: "@/art/context/w.md",
+      taskDelivery: "artifact",
+      childId: "id1",
+      activityFile: "/a.json",
+      autoExit: false,
+      targetCwd: null,
+      rawArtifact: true,
+    });
+    assert.ok(launchRaw.command.includes("--disable-file-wrapper"));
+    const resumeDef = buildPiResumePlan({
+      sessionPath: "/s.jsonl",
+      loadout: baseLoadout,
+      artifactDir: "/art",
+      name: "W",
+      surface: "7",
+      id: "id1",
+      activityFile: "/a.json",
+      resumeCwd: null,
+    });
+    assert.ok(!resumeDef.command.includes("--disable-file-wrapper"));
+    const resumeRaw = buildPiResumePlan({
+      sessionPath: "/s.jsonl",
+      loadout: { ...baseLoadout, rawArtifact: true },
+      artifactDir: "/art",
+      name: "W",
+      surface: "7",
+      id: "id1",
+      activityFile: "/a.json",
+      resumeCwd: null,
+      rawArtifact: true,
+    });
+    assert.ok(resumeRaw.command.includes("--disable-file-wrapper"));
+  });
+
+  it("resolveRawArtifact defaults to raw; explicit false opts out", async () => {
+    const { resolveRawArtifact } = await import("../pi-extension/subagents/agents.ts");
+    assert.equal(resolveRawArtifact(undefined), true);
+    assert.equal(resolveRawArtifact(null), true);
+    assert.equal(resolveRawArtifact({}), true);
+    assert.equal(resolveRawArtifact({ rawArtifact: true }), true);
+    assert.equal(resolveRawArtifact({ rawArtifact: false }), false);
+  });
+
+  it("parseAgentDefinition reads raw-artifact frontmatter; absent stays undefined (lifecycle resolves to raw)", async () => {
+    const { parseAgentDefinition } = await import("../pi-extension/subagents/agents.ts");
+    const on = parseAgentDefinition("---\nname: w\nraw-artifact: true\n---\nbody\n", "w");
+    assert.equal(on?.rawArtifact, true);
+    const off = parseAgentDefinition("---\nname: w\n---\nbody\n", "w");
+    assert.equal(off?.rawArtifact, undefined);
+  });
+
+  it("loadout accepts pre-flag snapshots (missing field), normalizes read to false", async () => {
+    const { isValidSubagentLoadout, readSubagentLoadout, loadoutSidecarPath, writeSubagentLoadout } =
+      await import("../pi-extension/subagents/session/loadout.ts");
+    const legacy = { ...baseLoadout };
+    delete (legacy as Record<string, unknown>).rawArtifact;
+    assert.equal(isValidSubagentLoadout(legacy), true);
+    assert.equal(isValidSubagentLoadout({ ...baseLoadout, rawArtifact: "yes" }), false);
+    const dir = mkdtempSync(join(tmpdir(), "rawart-"));
+    const sf = join(dir, "s.jsonl");
+    writeFileSync(sf, "{}\n");
+    writeFileSync(loadoutSidecarPath(sf), JSON.stringify(legacy));
+    assert.equal(readSubagentLoadout(sf)?.rawArtifact, false);
+    writeSubagentLoadout(sf, { ...baseLoadout, rawArtifact: true });
+    assert.equal(readSubagentLoadout(sf)?.rawArtifact, true);
+  });
+});

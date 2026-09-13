@@ -254,6 +254,8 @@ export interface PiCommandOpts {
   artifactDir: string;
   name: string;
   promptArgs: string[];
+  /** Opt-in raw artifact: append core `--disable-file-wrapper` (Proposal A). Absent/false = byte-identical output. */
+  rawArtifact?: boolean;
 }
 
 export function buildPiParts(opts: PiCommandOpts): string[] {
@@ -262,6 +264,7 @@ export function buildPiParts(opts: PiCommandOpts): string[] {
   const subagentDonePath = join(getSubagentsDir(), "subagent-done.ts");
   parts.push("-e", shellEscape(subagentDonePath));
   applySandboxToParts(parts, opts.loadout, { artifactDir: opts.artifactDir, name: opts.name });
+  if (opts.rawArtifact) parts.push("--disable-file-wrapper");
   for (const promptArg of opts.promptArgs) {
     parts.push(shellEscape(promptArg));
   }
@@ -310,6 +313,8 @@ export function buildPiLaunchPlan(opts: {
   activityFile: string;
   autoExit: boolean;
   targetCwd: string | null;
+  /** Forwarded to buildPiParts: raw `@artifact` delivery via core flag. */
+  rawArtifact?: boolean;
 }): PiLaunchPlan {
   const promptArgs = buildPiPromptArgs({
     effectiveSkills: opts.effectiveSkills,
@@ -322,6 +327,7 @@ export function buildPiLaunchPlan(opts: {
     artifactDir: opts.artifactDir,
     name: opts.name,
     promptArgs,
+    rawArtifact: opts.rawArtifact,
   });
   const envPrefix = buildEnvPrefix({
     agentDir: opts.loadout.agentDir,
@@ -373,6 +379,8 @@ export function buildPiResumePlan(opts: {
   resumeCwd: string | null;
   stamp?: number | string;
   msgTimestamp?: string;
+  /** Resume replays the launch-time raw-artifact choice from the loadout snapshot. */
+  rawArtifact?: boolean;
 }): PiResumePlan {
   let resumeMsgFile: string | undefined;
   if (opts.message) {
@@ -385,6 +393,7 @@ export function buildPiResumePlan(opts: {
     artifactDir: opts.artifactDir,
     name: opts.name,
     promptArgs: resumeMsgFile ? [`@${resumeMsgFile}`] : [],
+    rawArtifact: opts.rawArtifact,
   });
   const envPrefix = buildEnvPrefix({
     agentDir: opts.loadout.agentDir ?? process.env.PI_CODING_AGENT_DIR ?? null,
